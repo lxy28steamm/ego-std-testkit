@@ -135,3 +135,19 @@ ego-std-test/
 **采集总是断？**
 用「③ IMU 队列监控」盯一轮，水位冲高 + `drop_count` 增长说明队列被打满；
 再用「④ 串口探测」看实际帧率是否远超配置值。
+
+## 推送到 GitHub
+
+代码要备份到 GitHub 时，双击 `推送到GitHub.bat`，按提示粘贴一次 Token 即可。它会自动建私有仓库 `ego-std-testkit`、推送 main 分支，并把 Token 从本地 `.git/config` 里抹掉。
+
+Token 生成入口：<https://github.com/settings/tokens/new> —— Note 随便填，Expiration 选 7 days，只勾最上面的 `repo`，生成后复制那串 `ghp_` 开头的字符。
+
+也可以用命令行：
+
+```bash
+python push_github.py --check      # 只检查本地准备情况，不联网、不需要 Token
+python push_github.py ghp_xxxxx    # 直接带 Token 推
+python push_github.py --repo 别的名字 --public   # 换仓库名 / 建公开仓库（不建议）
+```
+
+推送完成后，建议到 <https://github.com/settings/tokens> 把那个 Token 删掉——删掉不影响仓库和代码。
