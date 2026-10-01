@@ -183,6 +183,31 @@ def main() -> int:
         print("  创建成功")
     elif code == 422:
         print("  仓库已存在，直接复用")
+    elif code == 404:
+        # 这是 fine-grained 长令牌最典型的坑：能认证、能读，但没有建仓权限，
+        # GitHub 为了不泄露仓库是否存在，统一返回 404 而不是 403。
+        print("  失败（HTTP 404）：这个 Token 没有创建仓库的权限。")
+        print()
+        print("  ┌─ 原因 ─────────────────────────────────────────────")
+        print("  │ 你现在用的是 GitHub 新版默认的 fine-grained（细粒度）Token，")
+        print("  │ 它默认不给「Administration: Read and write」权限，")
+        print("  │ 所以只能读、不能建仓库。")
+        print("  │")
+        print("  │ 换成 classic（经典）Token，一个勾就够：")
+        print("  │   1. 打开 https://github.com/settings/tokens")
+        print("  │   2. 左侧菜单点 Tokens (classic)   ← 注意不是 Fine-grained")
+        print("  │   3. 右上 Generate new token → Generate new token (classic)")
+        print("  │   4. Note 填 ego-std-testkit，Expiration 选 7 days")
+        print("  │   5. 只勾最上面那块 repo")
+        print("  │   6. 拉到底点 Generate token，复制 ghp_ 开头那串")
+        print("  └────────────────────────────────────────────────────")
+        print("  如果你确实想继续用 fine-grained，就必须重建一个，并同时满足：")
+        print("    · Repository access 选 All repositories")
+        print("    · Permissions → Administration 设为 Read and write")
+        print("    · Permissions → Contents 设为 Read and write")
+        print()
+        print(f"  原始响应：{body}")
+        return 1
     else:
         print(f"  失败（HTTP {code}）：{body}")
         return 1

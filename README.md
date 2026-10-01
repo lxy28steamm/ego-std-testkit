@@ -140,7 +140,9 @@ ego-std-test/
 
 代码要备份到 GitHub 时，双击 `推送到GitHub.bat`，按提示粘贴一次 Token 即可。它会自动建私有仓库 `ego-std-testkit`、推送 main 分支，并把 Token 从本地 `.git/config` 里抹掉。
 
-Token 生成入口：<https://github.com/settings/tokens/new> —— Note 随便填，Expiration 选 7 days，只勾最上面的 `repo`，生成后复制那串 `ghp_` 开头的字符。
+Token 生成入口：<https://github.com/settings/tokens> → 左侧点 **Tokens (classic)**（**不是** Fine-grained）→ 右上 Generate new token (classic) → Note 随便填，Expiration 选 7 days，只勾最上面的 `repo` → 生成后复制那串 `ghp_` 开头的字符。
+
+> **务必用 classic Token。** GitHub 现在默认把你引到 Fine-grained（细粒度）页面，那种 Token 默认没有 `Administration: Read and write`，只能读、**建不了仓库**，而且报错是 `HTTP 404`（GitHub 故意用 404 隐藏权限细节，不好排查）。非要用细粒度的话，必须同时满足三条：Repository access 选 **All repositories**、`Administration` 设 **Read and write**、`Contents` 设 **Read and write**。
 
 也可以用命令行：
 
