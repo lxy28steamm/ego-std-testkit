@@ -1,0 +1,31 @@
+# 虚拟环境
+.venv/
+.venv-gui/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 运行产物与报告（可能含设备序列号 / 现场信息）
+out/
+export/
+*.csv
+*.log
+
+# 本机设备地址（含内网 IP，不入库）
+device_ip.txt
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# 临时文件
+*.bak
+*.tmp
+~*
