@@ -39,9 +39,15 @@ SENSITIVE_NAMES = {"device_ip.txt", ".env", "token.txt", "secrets.json", "creden
 
 
 def git(*args: str, timeout: int = 120) -> tuple[int, str]:
+    # 关键：本机 git 可能配了 credential.helper（如 Windows 的 helper-selector /
+    # Git Credential Manager）。一旦它认为需要凭据，就会弹出一个图形窗口并一直等下去，
+    # 表现为命令永久卡住。这里统一关掉交互提示，并靠 URL 内嵌的 Token 完成认证。
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "never"
     p = subprocess.run(
         ["git", *args], cwd=str(BASE), capture_output=True, text=True,
-        encoding="utf-8", errors="replace", timeout=timeout,
+        encoding="utf-8", errors="replace", timeout=timeout, env=env,
     )
     return p.returncode, (p.stdout + p.stderr).strip()
 
@@ -222,10 +228,12 @@ def main() -> int:
         git("remote", "set-url", "origin", remote)
     else:
         git("remote", "add", "origin", remote)
-    rc, out = git("push", "-u", "origin", "main", timeout=300)
+    rc, out = git("-c", "credential.helper=", "push", "-u", "origin", "main", timeout=300)
     print("  " + (out.replace(token, "***") if out else "(无输出)"))
     if rc != 0:
         print("  推送失败。")
+        print("  若提示需要用户名/密码，说明 remote 里的 Token 没生效；")
+        print("  若命令长时间无响应，检查是否被系统的凭据管理窗口挡住。")
         scrub_token_from_remote(login, args.repo)
         return 1
 
