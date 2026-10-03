@@ -30,6 +30,7 @@ echo   5  导出 Excel
 echo   6  批量巡检 (多台设备, 并发)
 echo   8  自动扫描设备IP并记住
 echo   9  修改设备IP (当前 %HOST%)
+echo  10  一键采传 (选任务→采集→上传云端)
 echo   0  退出
 echo ==========================================
 set "CH="
@@ -43,6 +44,7 @@ if "%CH%"=="5" goto c5
 if "%CH%"=="6" goto c6
 if "%CH%"=="8" goto c8
 if "%CH%"=="9" goto c9
+if "%CH%"=="10" goto c10
 if "%CH%"=="0" goto end
 goto menu
 
@@ -121,6 +123,24 @@ set "NEWH="
 set /p "NEWH=新的设备IP: "
 if not "%NEWH%"=="" set "HOST=%NEWH%"
 goto menu
+
+:c10
+chcp 65001 >nul
+set "ACCT="
+set /p "ACCT=云账号手机号(直接回车=跳过上传, 只采集): "
+if "%ACCT%"=="" (
+  "%PY%" collect_and_upload.py --host %HOST% --skip-upload
+) else (
+  set "SECS=5"
+  set /p SECS=采集秒数(默认5): 
+  if not "%SECS%"=="" (
+    "%PY%" collect_and_upload.py --host %HOST% --seconds %SECS% --account %ACCT%
+  ) else (
+    "%PY%" collect_and_upload.py --host %HOST% --account %ACCT%
+  )
+)
+chcp 936 >nul
+goto pause
 
 :pause
 echo.

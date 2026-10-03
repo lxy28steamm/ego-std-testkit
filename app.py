@@ -19,9 +19,11 @@ import re
 import sys
 import json
 from datetime import datetime
+from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, QObject, Signal, QSize, QThread, QTimer
+from PySide6.QtCore import (
+    Qt, QProcess, QProcessEnvironment, QObject, Signal, QSize, QThread, QTimer, QEvent)
 from PySide6.QtGui import QFont, QColor, QTextCursor, QPixmap, QPainter
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -342,14 +344,26 @@ class CheckupPanel(Panel):
     def build_controls(self) -> None:
         g = self.ctrl_layout
 
-        g.addWidget(QLabel("头环型号"), 0, 0)
+        g.addWidget(QLabel("相机型号"), 0, 0)
         self.model = QComboBox()
-        self.model.addItem("不校验", "")
-        self.model.addItem("233（1080P）", "233")
-        self.model.addItem("235（2K）", "235")
+        # 这两个值不只是"比对分辨率"，还会先 PUT /device-selection 把设备
+        # 的相机槽位切成对应那个，再判硬件 —— 233 → ego-lite-01，235 → ego-std-235
+        self.model.addItem("不指定（按当前槽位）", "")
+        self.model.addItem("233（ego-std）", "233")
+        self.model.addItem("235（ego-std235）", "235")
         self.model.setCurrentIndex(2)
-        self.model.setFixedWidth(150)
+        self.model.setFixedWidth(190)
+        self.model.setToolTip(
+            "会先把设备切到对应相机槽位再自检：\n"
+            "  233 → 设备槽位 ego-lite-01\n"
+            "  235 → 设备槽位 ego-std-235\n"
+            "（切换只改生效槽位，不动已采的数据文件）")
+        self.model.currentIndexChanged.connect(lambda _i: self._sync_sel_hint())
         g.addWidget(self.model, 0, 1)
+
+        self.sel_hint = QLabel()
+        self.sel_hint.setStyleSheet("color:#8b93a1;font-size:12px")
+        g.addWidget(self.sel_hint, 1, 0, 1, 2)
 
         g.addWidget(QLabel("Livstudio 账号"), 0, 2)
         self.acct = QLineEdit()
@@ -363,12 +377,19 @@ class CheckupPanel(Panel):
         g.addWidget(self.pwd, 1, 3)
 
         self.do_collect = QCheckBox("实测一轮采集（会往设备写文件，约 30 秒）")
-        g.addWidget(self.do_collect, 1, 0, 1, 2)
+        g.addWidget(self.do_collect, 2, 0, 1, 2)
 
         # 型号列固定宽，把多余空间让给输入框
         g.setColumnStretch(1, 0)
         g.setColumnStretch(3, 1)
         g.setColumnMinimumWidth(2, 90)
+        self._sync_sel_hint()
+
+    def _sync_sel_hint(self) -> None:
+        m = self.model.currentData()
+        slot = {"233": "ego-lite-01", "235": "ego-std-235"}.get(m, "")
+        self.sel_hint.setText(
+            f"将切到设备槽位 {slot} 后自检" if slot else "不切槽位，按设备当前生效相机检查")
 
     def build_middle(self, root) -> None:
         self.banner = QLabel("")
@@ -494,7 +515,7 @@ class BatchWorker(QObject):
 
 
 class BatchPanel(Panel):
-    title = "② 批量巡检"
+    title = "③ 批量巡检"
     desc = ("一次给一整批设备（17 台 / 整间实验室）跑同一套体检，并发执行，"
             "结束后出一张总表：谁的版本落后、谁没接相机、谁不合格，一眼挑完。")
 
@@ -515,11 +536,13 @@ class BatchPanel(Panel):
 
         g.addWidget(QLabel("头环型号"), 0, 2)
         self.model = QComboBox()
-        self.model.addItem("不校验", "")
-        self.model.addItem("233（1080P）", "233")
-        self.model.addItem("235（2K）", "235")
+        self.model.addItem("不指定", "")
+        self.model.addItem("233（ego-std）", "233")
+        self.model.addItem("235（ego-std235）", "235")
         self.model.setCurrentIndex(2)
-        self.model.setFixedWidth(140)
+        self.model.setFixedWidth(170)
+        self.model.setToolTip("每台都会先切到对应相机槽位再自检：\n"
+                              "233 → ego-lite-01，235 → ego-std-235")
         g.addWidget(self.model, 0, 3)
 
         g.addWidget(QLabel("并发数"), 1, 0)
@@ -956,7 +979,7 @@ class BatchPanel(Panel):
 
 
 class FindPanel(Panel):
-    title = "③ 设备发现"
+    title = "④ 设备发现"
     desc = "不知道设备 IP 时用这个。扫描本机所在网段，只有能拉通 API 的才算设备。"
 
     def build_controls(self) -> None:
@@ -990,7 +1013,7 @@ class FindPanel(Panel):
 
 
 class WatchPanel(Panel):
-    title = "④ IMU 队列监控"
+    title = "⑤ IMU 队列监控"
     desc = "实时盯录制队列水位与各数据流频率。掉线前水位会先冲高，这里是抓现行的地方。"
 
     def build_controls(self) -> None:
@@ -1020,8 +1043,109 @@ class WatchPanel(Panel):
         return args
 
 
+class CollectPanel(Panel):
+    title = "② 一键采传"
+    desc = ("选任务 → 采集 → 验盘 → 上传云端 → 校验，一条命令跑完。"
+            "对应设备 /remote 页面上人工点的那套动作。"
+            "⚠ 上传默认会删设备上的本地 mcap（避免同目录反复重传），要留底先在设备侧拷走。")
+
+    def build_controls(self) -> None:
+        g = self.ctrl_layout
+
+        g.addWidget(QLabel("云账号"), 0, 0)
+        self.acct = QLineEdit()
+        self.acct.setPlaceholderText("采集员手机号，留空=只采集不上传")
+        g.addWidget(self.acct, 0, 1, 1, 3)
+
+        g.addWidget(QLabel("采集秒数"), 1, 0)
+        self.secs = QSpinBox()
+        self.secs.setRange(1, 3600)
+        self.secs.setValue(5)
+        self.secs.setSuffix(" 秒")
+        g.addWidget(self.secs, 1, 1)
+
+        g.addWidget(QLabel("方式"), 1, 2)
+        self.mode = QComboBox()
+        self.mode.addItem("完整：采集 + 上传", "full")
+        self.mode.addItem("只读检查（不采集不传）", "dry")
+        self.mode.addItem("只采集，不上传", "collect")
+        g.addWidget(self.mode, 1, 3)
+
+        self.chk_keep = QCheckBox("上传后保留设备上的本地 mcap")
+        self.chk_keep.setToolTip(
+            "默认不勾。保留会让同目录文件越堆越多，下次上传把历史文件全部重传一遍。\n"
+            "确实要留底才勾，并且知道代价。"
+        )
+        g.addWidget(self.chk_keep, 2, 0, 1, 2)
+
+        g.addWidget(QLabel("密码在启动后于命令行输入（不写进代码、不留 shell 历史）"), 2, 2, 1, 2)
+        g.setColumnStretch(1, 1)
+
+    def build_args(self) -> list[str]:
+        args = ["collect_and_upload.py", "--seconds", str(self.secs.value())]
+        h = WINDOW.device_ip()
+        if h:
+            args += ["--host", h]
+        acct = self.acct.text().strip()
+        mode = self.mode.currentData()
+        if mode == "dry":
+            args += ["--dry-run"]
+            # dry-run 也需要账号才能查任务/目录
+            if acct:
+                args += ["--account", acct]
+        elif mode == "collect" or not acct:
+            args += ["--skip-upload"]
+        else:
+            args += ["--account", acct]
+        if self.chk_keep.isChecked():
+            args += ["--keep-local"]
+        return args
+
+    def on_run(self) -> None:
+        """采集会真写数据、上传会真连云端，开跑前确认一次。"""
+        args = self.build_args()
+        if not args:
+            return
+        if "--dry-run" in args:
+            super().on_run()
+            return
+        need_acct = "--skip-upload" not in args
+        what = "采集并上传到云端" if need_acct else f"采集 {self.secs.value()} 秒（不上传）"
+        yes = QMessageBox.question(
+            self, "确认开始采传",
+            f"将对设备执行：{what}\n\n"
+            "· 采集期间请勿拔相机、勿断电\n"
+            + ("· 上传完成后设备上的本地 mcap 会被删除\n" if need_acct and not self.chk_keep.isChecked() else "")
+            + ("· 密码将在命令行里输入，不会写进代码\n" if need_acct else ""),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if yes != QMessageBox.Yes:
+            return
+        self.btn_run.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.out.clear()
+        if not self.runner.start(args):
+            self.on_finished(-1)
+
+    @staticmethod
+    def colorize(line: str) -> str:
+        """把 [OK] / [!] / [X] 上色，扫一眼就知道哪步出了问题。"""
+        t = line.rstrip()
+        if t.startswith("[OK]"):
+            return f"<span style='color:{C_OK}'>{escape(t)}</span>"
+        if t.startswith("[!]"):
+            return f"<span style='color:{C_WARN}'>{escape(t)}</span>"
+        if t.startswith("[X]"):
+            return f"<span style='color:{C_BAD}'>{escape(t)}</span>"
+        if t.startswith("===") or t.strip() == "":
+            return f"<b style='color:#5b6472'>{escape(t)}</b>"
+        if re.match(r"^\s+\d+\.", t):        # 步骤序号行
+            return f"<b style='color:#1a5fd0'>{escape(t)}</b>"
+        return escape(t)
+
+
 class SerialPanel(Panel):
-    title = "⑤ 串口探测"
+    title = "⑥ 串口探测"
     desc = ("直接读头环 IMU 串口，统计真实字节率与帧率。用来判断设备实际输出频率是不是"
             "远超配置值（这是采集掉线的根源之一）。")
 
@@ -1048,7 +1172,7 @@ class SerialPanel(Panel):
 
 
 class BatteryPanel(Panel):
-    title = "⑥ 电池采样"
+    title = "⑦ 电池采样"
     desc = ("连续采样电池电压/电流/电量，结束时判定充不满的根因"
             "（电量计未校准 / 充不进去 / 净放电）。")
 
@@ -1085,7 +1209,7 @@ class BatteryPanel(Panel):
 
 
 class SrcPanel(Panel):
-    title = "⑦ 源码查看"
+    title = "⑧ 源码查看"
     desc = ("不装 docker、不要 sudo，直接读设备上正在跑的容器源码。"
             "升级前后对比关键代码，可当验收依据。")
 
@@ -1139,7 +1263,7 @@ class SrcPanel(Panel):
 
 
 class LogPanel(Panel):
-    title = "⑧ 运行日志"
+    title = "⑨ 运行日志"
     desc = "探测设备上日志都放在哪（systemd / 应用目录 / 容器 stdout），并列出最近内容。"
 
     def build_controls(self) -> None:
@@ -1155,8 +1279,158 @@ class LogPanel(Panel):
         return args
 
 
+class CmdPanel(Panel):
+    """命令台：直接敲命令跑。不想为一次性排查再写一个脚本时用这里。
+
+    三种模式：
+      api  —— 调设备 HTTP 接口（GET/POST/PUT/DELETE），{path} 会被替换成当前设备 IP
+      ssh  —— 在设备上执行 shell 命令
+      py   —— 用本机 python 跑（可以跟 .py 脚本名 + 参数）
+    历史记录存在 QSettings 里，翻 up/down 能翻到上次敲的。
+    """
+    title = "⑩ 命令台"
+    desc = ("临时敲命令排查用，不用为一次性动作再写脚本。"
+            "api 模式里的 {ip} 会自动替换成上面填的设备 IP；"
+            "历史命令按 ↑↓ 翻，Tab 补全脚本名。")
+
+    SCRIPTS = ["ego_api_test.py", "batch_check.py", "collect_and_upload.py",
+               "devip.py", "_probe_src.py", "_probe_logs.py", "_probe_serial.py"]
+
+    def build_controls(self) -> None:
+        g = self.ctrl_layout
+
+        g.addWidget(QLabel("模式"), 0, 0)
+        self.mode = QComboBox()
+        for k, v in [("设备 API", "api"), ("设备 SSH", "ssh"), ("本机 Python", "py")]:
+            self.mode.addItem(k, v)
+        self.mode.currentIndexChanged.connect(self._sync_hint)
+        g.addWidget(self.mode, 0, 1)
+
+        self.lbl_cmd = QLabel("命令")
+        g.addWidget(self.lbl_cmd, 0, 2)
+        self.cmd = QLineEdit()
+        self.cmd.setPlaceholderText("如 /api/v2/session")
+        self.cmd.returnPressed.connect(self.on_run)      # 回车直接跑
+        self.cmd.installEventFilter(self)
+        g.addWidget(self.cmd, 0, 3)
+
+        self.lbl_body = QLabel("Body")
+        g.addWidget(self.lbl_body, 1, 0)
+        self.body = QLineEdit()
+        self.body.setPlaceholderText('JSON，如 {"command_id":"cli-1","reason":"operator_request"}'
+                                     '（GET/DELETE 一般留空）')
+        g.addWidget(self.body, 1, 2, 1, 2)
+
+        self.hint = QLabel()
+        self.hint.setStyleSheet("color:#8b93a1;font-size:12px")
+        self.hint.setWordWrap(True)
+        g.addWidget(self.hint, 2, 0, 1, 4)
+
+        self._hist: list[str] = []
+        self._hist_i = 0
+        self._sync_hint()
+
+    def build_middle(self, root) -> None:
+        # ⚠️ 基类的控件创建顺序：build_controls → btn_row(含 btn_run) → build_middle → out。
+        # 所以这里只能碰 btn_*，碰 self.out 会 AttributeError。占位文字放到 on_run 里设。
+        self.btn_run.setText("执行")
+        self.btn_run.setMinimumWidth(96)
+
+    # --- 输入历史 / Tab 补全 -----------------------------------------
+    def eventFilter(self, obj, ev):
+        if obj is self.cmd and ev.type() == QEvent.KeyPress:
+            if ev.key() in (Qt.Key_Up, Qt.Key_Down):
+                self._walk_history(-1 if ev.key() == Qt.Key_Up else 1)
+                return True
+            if ev.key() == Qt.Key_Tab:
+                self._complete()
+                return True
+        return super().eventFilter(obj, ev)
+
+    def _walk_history(self, step: int) -> None:
+        if not self._hist:
+            return
+        self._hist_i = max(0, min(len(self._hist), self._hist_i + step))
+        self.cmd.setText("" if self._hist_i >= len(self._hist) else self._hist[self._hist_i])
+
+    def _complete(self) -> None:
+        t = self.cmd.text().strip()
+        if not t or " " in t:
+            return
+        for s in self.SCRIPTS:
+            if s.startswith(t):
+                self.cmd.setText(s)
+                return
+
+    # --- 提示 ---------------------------------------------------------
+    def _sync_hint(self) -> None:
+        m = self.mode.currentData()
+        h = WINDOW.device_ip() if WINDOW else ""
+        if m == "api":
+            self.lbl_cmd.setText("路径")
+            self.cmd.setPlaceholderText("如 /api/v2/session")
+            self.hint.setText(f"设备 {h or '未填'} · 实际请求 http://{h or '<IP>'}:18000"
+                              f"{self.cmd.text() or '/…'}    方法可用 GET/POST/PUT/DELETE 前缀覆盖，"
+                              f"如 POST /api/v2/session/stop")
+            self.lbl_body.setVisible(True)
+            self.body.setVisible(True)
+        elif m == "ssh":
+            self.lbl_cmd.setText("Shell")
+            self.cmd.setPlaceholderText("如 df -h /media/ls/TSD302")
+            self.hint.setText(f"设备 {h or '未填'} · 用 ls/ls 登录，执行完自动打印输出")
+            self.lbl_body.setVisible(False)
+            self.body.setVisible(False)
+        else:
+            self.lbl_cmd.setText("脚本")
+            self.cmd.setPlaceholderText("如 ego_api_test.py --host " + (h or "192.168.x.x") + " --model 235")
+            self.hint.setText("回车运行。Tab 补全脚本名，↑↓ 翻历史。本机解释器 "
+                              + Path(PYEXE).name)
+            self.lbl_body.setVisible(False)
+            self.body.setVisible(False)
+
+    def build_args(self) -> list[str]:
+        return ["_cli.py", self.mode.currentData(), self.cmd.text().strip(),
+                self.body.text().strip()]
+
+    def on_run(self) -> None:
+        t = self.cmd.text().strip()
+        if not t:
+            QMessageBox.information(self, "命令为空", "先在上面填一条命令。")
+            return
+        if t not in self._hist:
+            self._hist.append(t)
+        self._hist_i = len(self._hist)
+        # 写操作二次确认：api 非 GET / ssh 任意命令都可能有副作用
+        m = self.mode.currentData()
+        risky = (m == "ssh") or (m == "api" and not t.upper().startswith(("GET", "HEAD")))
+        if risky:
+            yes = QMessageBox.question(
+                self, "确认执行写操作",
+                f"模式：{self.mode.currentText()}\n命令：{t}\n\n"
+                "这会真实改变设备状态（启停采集 / 改配置 / 删文件…）。\n"
+                "确认执行？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if yes != QMessageBox.Yes:
+                return
+        self._sync_hint()
+        super().on_run()
+
+    @staticmethod
+    def colorize(line: str) -> str:
+        t = line.rstrip()
+        if t.startswith("[OK]"):
+            return f"<span style='color:{C_OK}'>{escape(t)}</span>"
+        if t.startswith("[!]"):
+            return f"<span style='color:{C_WARN}'>{escape(t)}</span>"
+        if t.startswith("[X]"):
+            return f"<span style='color:{C_BAD}'>{escape(t)}</span>"
+        if t.startswith("===") or t.strip() == "":
+            return f"<b style='color:#5b6472'>{escape(t)}</b>"
+        return escape(t)
+
+
 class ExportPanel(QWidget):
-    title = "⑨ 报告与文件"
+    title = "⑪ 报告与文件"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1263,8 +1537,8 @@ class MainWindow(QMainWindow):
         body.addWidget(self.stack, 1)
         outer.addLayout(body, 1)
 
-        self.panels = [CheckupPanel(), BatchPanel(), FindPanel(), WatchPanel(),
-                       SerialPanel(), BatteryPanel(), SrcPanel(), LogPanel(),
+        self.panels = [CheckupPanel(), CollectPanel(), BatchPanel(), FindPanel(), WatchPanel(),
+                       SerialPanel(), BatteryPanel(), SrcPanel(), LogPanel(), CmdPanel(),
                        ExportPanel()]
         for p in self.panels:
             title = getattr(p, "title", "")
@@ -1272,7 +1546,13 @@ class MainWindow(QMainWindow):
             self.nav.addItem(it)
             self.stack.addWidget(p)
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.nav.currentRowChanged.connect(self._on_panel_changed)
         self.nav.setCurrentRow(0)
+
+    def _on_panel_changed(self, row: int) -> None:
+        """切面板时让命令台刷新提示 —— 设备 IP 可能刚被改过。"""
+        if 0 <= row < len(self.panels) and isinstance(self.panels[row], CmdPanel):
+            self.panels[row]._sync_hint()
 
         sb = QStatusBar()
         sb.setStyleSheet("QStatusBar{background:#f6f7f9;border-top:1px solid #e3e6ea;"
@@ -1364,7 +1644,7 @@ class MainWindow(QMainWindow):
                 "检查：\n"
                 "· 设备和电脑是否在同一个 WiFi / 网段\n"
                 "· 设备是否已开机\n\n"
-                "也可以在「② 设备发现」里指定额外网段再扫。"
+                "也可以在「④ 设备发现」里指定额外网段再扫。"
             )
 
     def scan_and_fill(self) -> None:

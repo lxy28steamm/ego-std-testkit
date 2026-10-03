@@ -256,6 +256,9 @@ def run_one(ip: str, port: int = 18000, timeout: int = 180, do_collect: bool = F
         "total": s.get("total", 0),
         "state": m.get("state", ""), "profile": m.get("profile", ""),
         "cameras": m.get("cameras", ""), "version": m.get("version", ""),
+        "sn": m.get("sn", ""), "serial": m.get("serial", ""),
+        "ldp_id": m.get("ldp_id", ""), "camera_sn": m.get("camera_sn", ""),
+        "model": m.get("model", ""), "slot": m.get("slot", ""),
         "items": d.get("items", []), "log": d.get("log", ""),
     })
     if p.returncode not in (0, 1):
@@ -311,10 +314,12 @@ def summarize_batch(recs: list[dict]) -> dict:
             "verdict": "FAIL" if bad else ("WARN" if warn else "PASS")}
 
 
-COLS = [("ip", "IP", 130), ("verdict", "结论", 70), ("state", "设备状态", 100),
-        ("cameras", "相机", 55), ("profile", "Profile", 100),
-        ("PASS", "PASS", 55), ("FAIL", "FAIL", 55), ("WARN", "WARN", 55),
-        ("secs", "耗时(s)", 75), ("version", "版本", 90), ("error", "错误", 220)]
+COLS = [("ip", "IP", 125), ("sn", "设备SN", 165), ("version", "版本", 80),
+        ("verdict", "结论", 65), ("state", "设备状态", 95),
+        ("cameras", "相机", 50), ("profile", "Profile", 95),
+        ("PASS", "PASS", 50), ("FAIL", "FAIL", 50), ("WARN", "WARN", 50),
+        ("secs", "耗时(s)", 70), ("ldp_id", "平台ID", 130),
+        ("camera_sn", "相机SN", 130), ("error", "错误", 200)]
 
 
 def _cell(rec: dict, key: str) -> str:
@@ -486,22 +491,25 @@ def _pad(s, n: int, right: bool = False) -> str:
 
 
 def _print_table(recs: list[dict], s: dict) -> None:
-    head = (f"{_pad('IP', 17)}{_pad('结论', 8)}{_pad('状态', 12)}{_pad('相机', 6)}"
+    # SN 和版本号是交付时对方一定要问的，放在最前面，别藏在备注里
+    head = (f"{_pad('IP', 17)}{_pad('设备SN', 21)}{_pad('版本', 9)}{_pad('结论', 8)}"
+            f"{_pad('状态', 11)}{_pad('相机', 5)}"
             f"{_pad('PASS', 5, True)}{_pad('FAIL', 5, True)}{_pad('WARN', 5, True)}"
-            f"{_pad('秒', 8, True)}  备注")
-    print("\n" + "=" * 100)
+            f"{_pad('秒', 7, True)}  备注")
+    print("\n" + "=" * 118)
     print(head)
-    print("-" * 100)
+    print("-" * 118)
     for r in recs:
         note = r.get("error") or ""
         if not note:
             bad = [f"{i['id']}" for i in r.get("items", []) if i.get("status") == "FAIL"]
             note = ("失败:" + ",".join(bad[:4])) if bad else ""
-        print(f"{_pad(r['ip'], 17)}{_pad(r['verdict'], 8)}"
-              f"{_pad(str(r.get('state', ''))[:10], 12)}{_pad(str(r.get('cameras', '')), 6)}"
+        print(f"{_pad(r['ip'], 17)}{_pad(str(r.get('sn', '')), 21)}"
+              f"{_pad(str(r.get('version', '')), 9)}{_pad(r['verdict'], 8)}"
+              f"{_pad(str(r.get('state', ''))[:9], 11)}{_pad(str(r.get('cameras', '')), 5)}"
               f"{_pad(r['PASS'], 5, True)}{_pad(r['FAIL'], 5, True)}{_pad(r['WARN'], 5, True)}"
-              f"{_pad(r['secs'], 8, True)}  {note[:40]}")
-    print("=" * 100)
+              f"{_pad(r['secs'], 7, True)}  {note[:36]}")
+    print("=" * 118)
     print(f"共 {s['total']} 台：合格 {s['PASS']} / 告警 {s['WARN']} / 不合格 {s['FAIL']}")
 
 

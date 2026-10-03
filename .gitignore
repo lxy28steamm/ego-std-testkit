@@ -19,6 +19,17 @@ export/
 # 本机设备地址（含内网 IP，不入库）
 device_ip.txt
 
+# 抓帧 / 落盘产物（mcap 单个就 50MB+，绝不入库）
+_frames/
+*.mcap
+*.bag
+*.jpg
+*.png
+
+# 设备端扒下来的前端产物与配置快照（含内部实现 + 设备信息）
+_remote.js
+_rollback/
+
 # 编辑器 / 系统
 .vscode/
 .idea/

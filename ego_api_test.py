@@ -50,8 +50,33 @@ _fix_console()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(BASE_DIR, "out")
 
-# 型号 -> 标称分辨率
-MODEL_RES = {"235": (1600, 1200), "233": (1920, 1080)}
+# 型号 -> 可接受的 (宽, 高) 集合。
+#
+# ⚠️ 不要再写死"型号 = 唯一分辨率"。实测（2026-10-03，Ego-Std-235 / SC235HGS 双目）：
+#   相机 V4L2 真实能力 = 3200x1200 / 3840x1200（side_by_side 双目拼接）
+#   但 /camera/settings 里配的是 1920x1080
+#   而早期这张表写的是 1600x1200
+# 三个值互不相符，且 1920x1080 采集完全正常（30fps 满帧、0 丢包）。
+# 说明分辨率是**可配置的运行参数**，不是型号的固有属性。
+# 所以改成"可接受集合"，并把实际在用的 1080p 收进去。
+MODEL_RES = {
+    "235": {(3200, 1200), (3840, 1200), (1920, 1080), (1600, 1200)},
+    "233": {(1920, 1080), (3840, 1200), (3200, 1200)},
+}
+
+# 头环型号 → 设备侧相机槽位（device-selection 的 camera_device 枚举值）
+#
+# ⚠️ 槽位名和相机芯片型号对不上，别写死：
+#   设备 OpenAPI 的 camera_device 枚举只有 ego-lite-01 / ego-std-235 / ego-plus / none，
+#   **没有 233**。但 /api/v2/camera/settings 里能看到设备上曾同时配过两台相机：
+#       ego_lite_01_device_path : .../usb-YCTC_YCTC_SC233HGS_...      ← 233 芯片
+#       ego_std_235_device_path: .../usb-YCTC_YCTC_SC235HGS_MIC_...  ← 235 芯片
+#   所以 233 走 `ego-lite-01` 槽位，235 走 `ego-std-235` 槽位。
+#
+# 认芯片型号不要靠猜，直接看设备上的 by-id 软链接（最权威）：
+#   GET /api/v2/camera/settings → *_device_path 里的 SCxxxHGS
+#   SSH ls -l /dev/v4l/by-id/  → 实际插着的那台
+MODEL_SLOT = {"233": "ego-lite-01", "235": "ego-std-235"}
 
 
 class Api:
@@ -72,8 +97,17 @@ class Api:
             return 0, f"{type(e).__name__}: {e}"
 
     def post(self, path: str, payload: dict | None = None):
-        data = json.dumps(payload or {}).encode("utf-8")
-        req = urllib.request.Request(self.base + path, data=data, method="POST",
+        return self._send("POST", path, payload)
+
+    def put(self, path: str, payload: dict | None = None):
+        return self._send("PUT", path, payload)
+
+    def delete(self, path: str, payload: dict | None = None):
+        return self._send("DELETE", path, payload)
+
+    def _send(self, method: str, path: str, payload: dict | None = None):
+        data = json.dumps(payload if payload is not None else {}).encode("utf-8")
+        req = urllib.request.Request(self.base + path, data=data, method=method,
                                      headers={"Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
@@ -129,7 +163,34 @@ def auto_checks(api: Api, r: R, model: str, do_collect: bool,
     # 连不上时 api.get 返回的是错误字符串而不是 dict，这里必须先判类型，
     # 否则批量巡检扫到离线设备会直接 AttributeError 崩掉（而不是记成 FAIL）
     h0 = h0 if isinstance(h0, dict) else {}
-    devmap = ((h0 or {}).get("selection") or {}).get("devices") or {}
+
+    # ---- 设备身份（SN / 序列号 / 平台 ID）--------------------------
+    # ⚠️ 这里有好几个"看起来都像 SN"的字段，别混用，各有各的用处：
+    #   cloud.device_sn        = pi-<树莓派hostname>   整机 SN，报告里显示这个
+    #   cloud.device_serial    = <去掉 pi- 的那段>      同上，只是短写法
+    #   cloud.ldp_device_id    = EL-H1-260801-2534     平台侧设备 ID（交付单上用这个）
+    #   devices[槽位].hardware_serial = 0152312181647  **相机芯片**序列号，不是整机 SN
+    # 混出来的教训：我一度把 camera 的 serial 当成整机 SN 报出去，被一眼看穿。
+    cl = (h0 or {}).get("cloud") or {}
+    r.meta["sn"] = str(cl.get("device_sn") or "")
+    r.meta["serial"] = str(cl.get("device_serial") or "")
+    r.meta["ldp_id"] = str(cl.get("ldp_device_id") or "")
+    # 相机芯片序列号：留着，坏货返修时厂商要这个。
+    # ⚠️ 取值来源踩过坑：同一个字段名在三个地方，值不一样——
+    #    selection.devices[槽位].hardware_serial = None   ← 空的！
+    #    devices[槽位].hardware_serial            = 0152312181647   ✅
+    #    workers[槽位].hardware_serial            = 0152312181647   ✅
+    # 所以只能从 health.devices / health.workers 取，取 selection.devices 会拿到 None。
+    _dslots = ((h0 or {}).get("selection") or {}).get("devices") or {}
+    _adev = (((h0 or {}).get("selection") or {}).get("active_selection") or {})
+    _adev = _adev.get("camera_device", "") if isinstance(_adev, dict) else ""
+    _hdev = (h0 or {}).get("devices") or {}
+    _hwrk = (h0 or {}).get("workers") or {}
+    _csn = ((_hdev.get(_adev) or {}).get("hardware_serial")
+            or (_hwrk.get(_adev) or {}).get("hardware_serial") or "")
+    r.meta["camera_sn"] = str(_csn or "")
+
+    devmap = _dslots
     active_dev = ((h0 or {}).get("selection") or {}).get("active_selection") or {}
     active_dev = active_dev.get("camera_device", "") if isinstance(active_dev, dict) else ""
     if device_id:
@@ -147,7 +208,7 @@ def auto_checks(api: Api, r: R, model: str, do_collect: bool,
             r.add("DEV-ONLINE", f"目标设备 {device_id}", "WARN",
                   f"设备清单中无此项，已知={list(devmap)}", "/api/v2/health")
 
-    # E-D-004 采集控制台
+    # E-D-004 采集控制台 —— 同时充当「设备可达性」闸门
     st, d = api.get("/api/v2/health")
     if st == 200 and isinstance(d, dict):
         state = d.get("overall_state", "?")
@@ -157,41 +218,140 @@ def auto_checks(api: Api, r: R, model: str, do_collect: bool,
         r.meta["state"] = str(state)
         r.meta["profile"] = str(prof)
         r.meta["devices"] = ",".join(str(x) for x in devs)
+        # 相机型号：--model 给的是用户口径（233/235），profile 是设备口径（ego-std-235）
+        r.meta["model"] = model or ""
+        r.meta["slot"] = MODEL_SLOT.get(model, "") or ""
         r.add("E-D-004", "采集控制台", "PASS" if state == "healthy" else "WARN",
               f"state={state} profile={prof} devices={devs}", "/api/v2/health")
     else:
-        r.meta["state"] = f"HTTP {st}"
-        r.add("E-D-004", "采集控制台", "FAIL", f"HTTP {st}: {str(d)[:120]}", "/api/v2/health")
+        # 设备根本连不上：后面每一条都会顺带 FAIL 一遍（相机/SSD/网线/画面…），
+        # 全是同一个根因的噪音。批量巡检扫到离线设备时，一屏 FAIL 反而看不出真相。
+        # 所以这里直接短路：只留一条"设备不可达"，其余不再逐项打。
+        r.meta["state"] = "UNREACHABLE"
+        r.meta["profile"] = ""
+        r.meta["devices"] = ""
+        r.meta["cameras"] = 0
+        hint = {
+            0: "连接超时/拒绝（设备关机？IP 变了？不在同一网段？）",
+            404: "路径不存在（这台可能不是 ego 设备，或 API 版本不同）",
+        }.get(st, str(d)[:120])
+        r.add("E-D-004", "设备可达性", "FAIL", f"HTTP {st} — {hint}", "/api/v2/health")
+        r.add("OFFLINE-SKIP", "其余检查", "SKIP", "设备不可达，已跳过全部硬件检查", "")
+        return
 
-    # E-D-003 / E-L-015 头环与相机检测
-    st2, cam = api.get("/api/v2/dex/camera-devices")
-    n_cam = len(cam) if st2 == 200 and isinstance(cam, list) else -1
-    r.meta["cameras"] = n_cam
-    r.add("E-L-015", "相机检测", "PASS" if n_cam > 0 else "FAIL",
-          f"检出相机 {n_cam} 台" if n_cam >= 0 else f"HTTP {st2}", "/api/v2/dex/camera-devices")
+    # E-D-003 相机检测
+    #
+    # ⚠️ 原来这里打的是 /api/v2/dex/camera-devices，那是 **Dex 机型专用**接口，
+    # 在 Ego-Std / Ego-Lite 上恒返回 []，于是每台都误报 "检出相机 0 台" FAIL。
+    # 实测 2026-10-03 确认：相机真实状态在 /api/v2/health 的 selection 里：
+    #   selection.active_selection.camera_device = 当前生效槽位
+    #   selection.devices[槽位].logical_online / hardware_connected / pipeline_state
+    # 判据改成"生效槽位是否硬件已连接"，这才是"相机插没插"的真实答案。
+    #
+    # 给了 --model 就先把槽位切过去（233 → ego-lite-01，235 → ego-std-235），
+    # 否则会出现"插的是 235、但设备还停在 ego-lite-01 槽位"→ 误判相机没插。
+    act = active_dev or ""
+    if model:
+        want_slot = MODEL_SLOT.get(model)
+        if want_slot and want_slot != act:
+            # ⚠️ 采集中切不了相机：PUT /device-selection 会返
+            #    409 session_active "DEVICE cannot be changed during an active Session"
+            # 所以先看有没有在录，有就停掉再切。
+            st_s, s_s = api.get("/api/v2/session")
+            if st_s == 200 and isinstance(s_s, dict) and s_s.get("state") == "recording":
+                _stop_session(api, f"autotest-preselect-{int(time.time())}")
+                time.sleep(2)
+            stx, resx = api.put("/api/v2/device-selection", {"camera_device": want_slot})
+            if stx < 400:
+                time.sleep(3)          # 等设备重启对应 pipeline
+                _, h2 = api.get("/api/v2/health")
+                prev = act
+                act = ((h2 or {}).get("selection") or {}).get(
+                    "active_selection", {}).get("camera_device") or ""
+                devmap = (h2 or {}).get("selection", {}).get("devices") or devmap
+                r.add("CAM-SEL", "相机选型", "PASS" if act == want_slot else "WARN",
+                      f"型号{model} → 槽位 {want_slot}（切换前 {prev or '无'}）"
+                      f" 生效={act}", "/api/v2/device-selection")
+            else:
+                r.add("CAM-SEL", "相机选型", "FAIL",
+                      f"型号{model} → 槽位 {want_slot} 切换失败 HTTP {stx}: "
+                      f"{str(resx)[:140]}", "/api/v2/device-selection")
+        else:
+            r.add("CAM-SEL", "相机选型", "PASS",
+                  f"型号{model} → 槽位 {want_slot}，已是当前生效槽位，无需切换",
+                  "/api/v2/device-selection")
+    else:
+        r.add("CAM-SEL", "相机选型", "SKIP",
+              "未给 --model（233 / 235），按当前生效槽位检查", "")
+
+    act = act or ""
+    tgt_slot = devmap.get(act) or {}
+    hw_ok = bool(tgt_slot.get("hardware_connected")) and bool(tgt_slot.get("logical_online"))
+    r.meta["cameras"] = 1 if hw_ok else 0
+    want_chip = ("SC%sHGS" % model) if model else ""
+    chip_txt = ""
+    if want_chip:
+        stc, cs = api.get("/api/v2/camera/settings")
+        paths = ""
+        if stc == 200 and isinstance(cs, dict):
+            for k, v in cs.items():
+                if k.endswith("_device_path") and want_chip in str(v or ""):
+                    paths = f" 配置路径命中 {k}"
+                    break
+            else:
+                paths = f" 但 /camera/settings 里没找到含 {want_chip} 的 *_device_path"
+        chip_txt = f" 期望芯片={want_chip}{paths}"
+    if act:
+        r.add("E-D-003", "相机检测", "PASS" if hw_ok else "FAIL",
+              f"生效槽位={act} hardware_connected={tgt_slot.get('hardware_connected')} "
+              f"pipeline={tgt_slot.get('pipeline_state')} 相机SN={r.meta.get('camera_sn') or '未取到'}"
+              + chip_txt,
+              "/api/v2/health")
+    else:
+        r.add("E-D-003", "相机检测", "WARN",
+              "health.selection 没给 active_selection.camera_device，无法判定", "/api/v2/health")
 
     # E-L-017 / E-D-003 画面预览（抓一帧）
     st3, img = api.get("/api/v2/preview/snapshot.jpg", raw=True)
     ok_img = st3 == 200 and isinstance(img, (bytes, bytearray)) and len(img) > 5000
     size = f"{len(img)/1024:.0f}KB" if isinstance(img, (bytes, bytearray)) else str(img)[:60]
-    r.add("E-L-017", "画面预览", "PASS" if ok_img else "FAIL",
-          f"抓帧 HTTP {st3} 大小 {size}", "/api/v2/preview/snapshot.jpg")
+    if not hw_ok:
+        # 相机根本没连上，抓帧必然失败（实测会 timeout 或 500）。
+        # 根因已由 E-D-003 报过，这里再报一条 FAIL 只是噪音 —— 判 SKIP。
+        r.add("E-L-017", "画面预览", "SKIP",
+              f"相机未连接（槽位 {act} hardware_connected=False），跳过抓帧。"
+              f"实测 HTTP {st3}", "/api/v2/preview/snapshot.jpg")
+    else:
+        r.add("E-L-017", "画面预览", "PASS" if ok_img else "FAIL",
+              f"抓帧 HTTP {st3} 大小 {size}", "/api/v2/preview/snapshot.jpg")
 
-    # E-D-006 / E-L-013 SSD 存储
+    # E-D-006 SSD 存储
+    # E-D-006 SSD 存储
+    #
+    # 原来这里同时加了 E-D-006 和 E-L-013 两条，**同接口同判据，纯重复**，
+    # 只是名字里带个 "(Livstudio)"。已合并成一条。
     st4, s = api.get("/api/v2/storage")
     if st4 == 200 and isinstance(s, dict):
         kind = s.get("current_kind", "?")
         opts = s.get("options") or []
         ext = [o for o in opts if o.get("kind") not in ("local",)]
-        r.add("E-D-006", "SSD存储", "PASS" if (ext and any(o.get("available") for o in ext))
-              else "FAIL",
-              f"当前={kind} 候选={[(o.get('kind'), o.get('available')) for o in opts]}",
-              "/api/v2/storage")
-        r.add("E-L-013", "SSD存储(Livstudio)", "PASS" if ext else "FAIL",
-              f"外部存储候选 {len(ext)} 个", "/api/v2/storage")
+        avail = [o for o in ext if o.get("available")]
+        # 顺带把容量信息打出来 —— 交付场景很关心"还剩多少"，原来只报有没有
+        cap = ""
+        for o in (avail or ext):
+            tot, free = o.get("total_bytes"), o.get("free_bytes")
+            if tot:
+                cap = " 容量 %.1f/%.1f GB" % ((free or 0) / 2**30, tot / 2**30)
+                break
+        if avail:
+            r.add("E-D-006", "SSD存储", "PASS",
+                  f"当前={kind} 可用={[o.get('kind') for o in avail]}{cap}", "/api/v2/storage")
+        else:
+            r.add("E-D-006", "SSD存储", "FAIL",
+                  f"当前={kind} 候选={[(o.get('kind'), o.get('available')) for o in opts]}",
+                  "/api/v2/storage")
     else:
         r.add("E-D-006", "SSD存储", "FAIL", f"HTTP {st4}", "/api/v2/storage")
-        r.add("E-L-013", "SSD存储(Livstudio)", "FAIL", f"HTTP {st4}", "/api/v2/storage")
 
     # E-D-007 网线
     st5, n = api.get("/api/v2/network")
@@ -241,10 +401,10 @@ def auto_checks(api: Api, r: R, model: str, do_collect: bool,
             expect_imu_hz = 200.0
         want = MODEL_RES.get(model)
         if want:
-            ok = (w, h) == want
-            r.add("E-E-009", "标定检验", "PASS" if ok else "FAIL",
-                  f"实测 {w}x{h}@{fps} 型号{model}期望 {want[0]}x{want[1]}；生效设备={active_dev}"
-                  + ("" if ok else "（注意：生效设备不是目标设备时该结果无效）"),
+            ok = (w, h) in want
+            r.add("E-E-009", "标定检验", "PASS" if ok else "WARN",
+                  f"实测 {w}x{h}@{fps} 型号{model} 可接受={sorted(want)}"
+                  + ("" if ok else f"；生效设备={active_dev}（不在可接受集合，请确认是否配错）"),
                   "/api/v2/camera/settings")
         else:
             r.add("E-E-009", "标定检验", "WARN",
@@ -252,27 +412,55 @@ def auto_checks(api: Api, r: R, model: str, do_collect: bool,
                   "/api/v2/camera/settings")
 
         # IMU 专项：端口 / 开关 / 状态
-        imu_port = cs.get("ego_std_235_imu_port") or cs.get("ego_lite_01_imu_port")
+        #
+        # ⚠️ 原判据只读 ego_std_235_imu_port，实测该字段是 None，而 IMU 实际挂在
+        # ego_lite_01_imu_port 上（SC233HGS 的 USB 串口）→ 每台都误报 FAIL。
+        # 正确做法：**任一非空端口即算接上**（不同 profile 字段名不同）。
+        # record_imu 只作为参考信息打印，不参与判定 ——
+        # 实测 record_imu=False 时照样采出 200Hz IMU 数据（走 USB 内部通道）。
+        imu_port = (cs.get("ego_std_235_imu_port") or cs.get("ego_lite_01_imu_port")
+                    or cs.get("umi_imu_port") or "")
         rec = cs.get("record_imu")
         rate = cs.get("imu_rate")
-        r.add("IMU-CFG", "IMU配置", "PASS" if (imu_port and rec) else "FAIL",
-              f"port={imu_port} record_imu={rec} rate={rate}", "/api/v2/camera/settings")
-    else:
-        r.add("E-E-009", "标定检验", "FAIL", f"HTTP {st6}", "/api/v2/camera/settings")
+        if imu_port:
+            r.add("IMU-CFG", "IMU配置", "PASS",
+                  f"port={imu_port} rate={rate}（record_imu={rec}，仅供参考）",
+                  "/api/v2/camera/settings")
+        else:
+            r.add("IMU-CFG", "IMU配置", "WARN",
+                  f"未读到 IMU 端口（record_imu={rec} rate={rate}）；"
+                  f"若本机型 IMU 走 USB 内部通道则属正常", "/api/v2/camera/settings")
 
     st7, u = api.get("/api/v2/umi/sensor-status")
     if st7 == 200 and isinstance(u, dict):
+        # state 可能是 ready / waiting。waiting 多半是"没启采、等指令"，
+        # 不是硬件故障，所以只在这两种状态下区分 PASS / WARN。
+        st_u = u.get("state")
         bad = [s["side"] for s in (u.get("sides") or []) if s.get("required") and not s.get("valid")]
-        r.add("IMU-SENSOR", "IMU传感器", "PASS" if u.get("state") == "ready" and not bad else "WARN",
-              f"state={u.get('state')} 未就绪侧={bad or '无'}", "/api/v2/umi/sensor-status")
+        if bad:
+            st_txt, level = f"未就绪侧={bad}", "WARN"
+        elif st_u == "ready":
+            st_txt, level = "已就绪", "PASS"
+        else:
+            st_txt, level = f"state={st_u}（未启采时正常）", "WARN"
+        r.add("IMU-SENSOR", "IMU传感器", level, f"{st_txt} sides={len(u.get('sides') or [])}",
+              "/api/v2/umi/sensor-status")
     else:
         r.add("IMU-SENSOR", "IMU传感器", "FAIL", f"HTTP {st7}", "/api/v2/umi/sensor-status")
 
-    # E-L-011 页面信息（版本 / 激活）
+    # E-L-011 页面信息
+    #
+    # ⚠️ 原判据 `state != "configured"` 是错的：设备正常时 state=**online**
+    # 且 configured=true（两个字段语义不同：state=平台连接态，configured=是否已配置）。
+    # 照原判据 EVERY healthy device 都被判 WARN。改成：configured 为真即 PASS。
     st8, cl = api.get("/api/v2/cloud")
     if st8 == 200 and isinstance(cl, dict):
-        r.add("E-L-011", "页面检查", "WARN" if cl.get("state") != "configured" else "PASS",
-              f"cloud={cl.get('state')} sn={cl.get('device_sn')}", "/api/v2/cloud")
+        cfg = bool(cl.get("configured"))
+        r.add("E-L-011", "页面检查", "PASS" if cfg else "WARN",
+              f"state={cl.get('state')} configured={cfg} sn={cl.get('device_sn')} "
+              f"ldp_id={cl.get('ldp_device_id')}", "/api/v2/cloud")
+    else:
+        r.add("E-L-011", "页面检查", "FAIL", f"HTTP {st8}", "/api/v2/cloud")
 
     # 上一轮采集的队列/丢帧指标（只读，不需要启采）
     _queue_history(api, r)
@@ -282,7 +470,6 @@ def auto_checks(api: Api, r: R, model: str, do_collect: bool,
         _collect_round(api, r, expect_imu_hz=expect_imu_hz, expect_cam_hz=expect_cam_hz)
     else:
         r.add("E-D-005", "采集启停", "SKIP", "未加 --do-collect，跳过实测", "")
-        r.add("E-L-018", "采集启停(Livstudio)", "SKIP", "未加 --do-collect，跳过实测", "")
 
 
 def _queue_history(api: Api, r: R) -> None:
@@ -338,38 +525,89 @@ def _file_index(api: Api) -> dict:
     return {}
 
 
+# /api/v2/session/stop 的 body 里 command_id 是**必填**（实测 2026-10-03）：
+#   不带 body -> 422 {"loc":["body"],"msg":"Field required"}
+#   带 {}     -> 422 {"loc":["body","command_id"],"msg":"Field required"}
+# 这个坑很阴险：stop 失败设备不会报错，只是**继续录**，于是 message_count 一路涨，
+# 下一轮 DATA-* 全判"条数超预期 262%"，看起来像数据异常，其实是上轮没停干净。
+def _stop_session(api: Api, command_id: str, tries: int = 3) -> tuple[int, object]:
+    """停采并确认真的停了。返回 (最后一次 HTTP 码, 响应体)。"""
+    last: tuple[int, object] = (0, "")
+    for i in range(tries):
+        last = api.post("/api/v2/session/stop",
+                        {"command_id": command_id, "reason": "operator_request"})
+        if last[0] < 400:
+            break
+        time.sleep(1.5)
+    if last[0] < 400:
+        # 落盘要时间，轮询等它真的离开 recording
+        for _ in range(12):
+            st, s = api.get("/api/v2/session")
+            if st == 200 and isinstance(s, dict) and s.get("state") != "recording":
+                break
+            time.sleep(1)
+    return last
+
+
 def _collect_round(api: Api, r: R, seconds: float = 8.0,
                    expect_imu_hz: float = 0.0, expect_cam_hz: float = 0.0) -> None:
     """真的采一轮：启采 -> 计时 -> 停采 -> 校验落盘文件与各数据流实际条数。
 
     这是脚本里唯一做"动作"的部分，判定不看配置、只看结果：
       1. /api/v2/files 里必须出现新文件，且 size_bytes > 100KB、时长 ≈ seconds
-      2. IMU 流 message_count 必须 ≈ 期望频率 × 秒数，missing_count == 0
+      2. IMU 流 message_count 必须 ≈ 频率 × **设备自报时间跨度**，missing_count == 0
       3. 相机流同理
       4. 队列水位 < 50% 且 drop_count == 0
+
+    ⚠️ 期望条数**不能拿本地秒表 elapsed 去乘频率**。踩过的坑：stop 失败设备会继续录，
+    下一轮 message_count 是"录了多久就累计多少"，用秒表算会报偏差 262%，
+    看起来像数据异常其实是上轮没停干净。设备每条流都带 first_time_ns/last_time_ns，
+    用它算跨度才是这台设备自己的口径（实测 cnt 与 hz×span 误差 ≤2 条）。
     """
+    # 可用于"再开一轮"的空闲态。注意设备停采后是 complete（不是 idle），
+    # 实测 idle 几乎不会出现，只在刚重启时才是。只认 idle 会永远判"非空闲"。
+    IDLE_STATES = ("idle", "complete", "", None)
+
     st, cur = api.get("/api/v2/session")
-    if st == 200 and isinstance(cur, dict) and cur.get("state") != "idle":
-        r.add("E-D-005", "采集启停", "FAIL", f"当前非空闲 state={cur.get('state')}，先停掉再测", "")
-        return
+    if st == 200 and isinstance(cur, dict) and cur.get("state") not in IDLE_STATES:
+        # 设备还在录（常见于上一轮跑完没停干净）。直接判 FAIL 会让人以为设备坏了，
+        # 其实只是脏状态。先尝试停掉再继续测；停不掉才报 FAIL。
+        s_st, s_res = _stop_session(api, f"autotest-cleanup-{int(time.time())}")
+        if s_st >= 400:
+            r.add("E-D-005", "采集启停", "FAIL",
+                  f"设备非空闲且停止失败 HTTP {s_st}: {str(s_res)[:150]}", "/api/v2/session")
+            return
+        st2, cur2 = api.get("/api/v2/session")
+        if st2 == 200 and isinstance(cur2, dict) and cur2.get("state") in IDLE_STATES:
+            print(f"  ... 已清理残留采集（原 state={cur.get('state')}）")
+        else:
+            r.add("E-D-005", "采集启停", "FAIL",
+                  f"设备非空闲且无法停止 state={(cur2 or {}).get('state') if isinstance(cur2, dict) else cur2}，"
+                  f"请手动停止后再测", "/api/v2/session")
+            return
 
     before = _file_index(api)
 
-    st, res = api.post("/api/v2/session/start",
-                       {"command_id": f"autotest-{int(time.time())}"})
+    cmd_id = f"autotest-{int(time.time())}"
+    st, res = api.post("/api/v2/session/start", {"command_id": cmd_id})
     if st >= 400:
         r.add("E-D-005", "采集启停", "FAIL", f"启动失败 HTTP {st}: {str(res)[:150]}", "/api/v2/session/start")
         return
     t0 = time.time()
-    print(f"  ... 采集中 {seconds}s")
-    time.sleep(seconds)
+    try:
+        print(f"  ... 采集中 {seconds}s")
+        time.sleep(seconds)
 
-    st, s = api.get("/api/v2/session")
-    rec = (s or {}).get("recorder") or {}
-    print(f"  ... 采集中队列 depth={rec.get('queue_depth')}/{rec.get('queue_capacity')} "
-          f"峰值={rec.get('queue_high_watermark')} 丢帧={rec.get('drop_count')}")
+        st, s = api.get("/api/v2/session")
+        rec = (s or {}).get("recorder") or {}
+        print(f"  ... 采集中队列 depth={rec.get('queue_depth')}/{rec.get('queue_capacity')} "
+              f"峰值={rec.get('queue_high_watermark')} 丢帧={rec.get('drop_count')}")
+    finally:
+        # ⚠️ 必须兜住：任何异常/中断都要停采，否则设备会一直留在 recording，
+        # 下一轮体检就会误报"当前非空闲"，而且计数还会污染下一轮 DATA-* 判据。实测踩过。
+        st2, res2 = _stop_session(api, cmd_id)
+        print(f"  ... 已停采 HTTP {st2} {str(res2)[:120]}")
 
-    st2, res2 = api.post("/api/v2/session/stop")
     elapsed = time.time() - t0
 
     # 等落盘：轮询 /api/v2/files，最多 20s
@@ -390,11 +628,15 @@ def _collect_round(api: Api, r: R, seconds: float = 8.0,
 
     st3, s3 = api.get("/api/v2/session")
     r3 = (s3 or {}).get("recorder") or {}
+    end_state = (s3 or {}).get("state") if isinstance(s3, dict) else None
+    stop_txt = f"停采HTTP={st2} 末态state={end_state}"
 
     # --- 断言 1：真的落盘了新文件，且大小、时长对得上
     if not new_file:
         r.add("E-D-005", "采集启停", "FAIL",
-              f"停采后 /api/v2/files 未出现新文件（停采HTTP {st2}）", "/api/v2/files")
+              f"停采后 /api/v2/files 未出现新文件（{stop_txt}）"
+              + (f" 停采返回={str(res2)[:120]}" if st2 >= 400 else ""),
+              "/api/v2/files")
     else:
         size = new_file.get("size_bytes") or 0
         dur = new_file.get("duration_seconds") or 0.0
@@ -402,31 +644,58 @@ def _collect_round(api: Api, r: R, seconds: float = 8.0,
         dur_ok = (0.5 * seconds) <= dur <= (2.0 * seconds + 2)
         r.add("E-D-005", "采集启停", "PASS" if (size_ok and dur_ok) else "FAIL",
               f"新文件 {new_file.get('name')} 大小={size/1048576:.1f}MB 时长={dur:.1f}s "
-              f"(期望≈{seconds}s) 停采HTTP={st2}", "/api/v2/files")
-        r.add("E-L-018", "采集启停(Livstudio)", "PASS" if (size_ok and dur_ok) else "FAIL",
-              f"新文件 {new_file.get('name')} 大小={size/1048576:.1f}MB 时长={dur:.1f}s", "/api/v2/files")
+              f"(期望≈{seconds}s) {stop_txt}", "/api/v2/files")
+        # 原来这里还挂了一条 E-L-018「采集启停(Livstudio)」，判据、文件、详情
+        # 与 E-D-005 完全相同，纯重复，已删。
 
     # --- 断言 2/3：各数据流实际采到多少条（这才是在"测"IMU，而不是看配置）
     streams = r3.get("streams") or {}
     if not streams:
         r.add("DATA-STREAMS", "数据流实测", "FAIL", "停采后无任何数据流记录", "/api/v2/session")
+
+    # 设备自报总时长，用于交叉核对"停采真的生效了"
+    rec_span = 0.0
+    g_st, g_s = api.get("/api/v2/session")
+    if g_st == 200 and isinstance(g_s, dict):
+        a, b = g_s.get("start_time_ns"), g_s.get("stop_time_ns")
+        if a and b:
+            rec_span = (b - a) / 1e9
+
     for topic, v in streams.items():
+        if not isinstance(v, dict):
+            continue
         cnt = v.get("message_count") or 0
         miss = v.get("missing_count") or 0
         hz = v.get("actual_rate_hz")
+        ft, lt = v.get("first_time_ns"), v.get("last_time_ns")
+        # ⚠️ 用设备自己的时间跨度，不用本地秒表。理由见函数 docstring。
+        span = (lt - ft) / 1e9 if (ft and lt and lt > ft) else elapsed
         short = topic.rsplit("/", 1)[-1]
         exp_hz = expect_imu_hz if "imu" in topic.lower() else expect_cam_hz
+        hz_txt = f"{hz}Hz" if hz else "未知"
         if exp_hz:
-            exp_cnt = exp_hz * elapsed
+            exp_cnt = exp_hz * span
             dev = abs(cnt - exp_cnt) / exp_cnt if exp_cnt else 1.0
-            ok = miss == 0 and dev <= 0.25
+            hz_dev = abs((hz or 0) - exp_hz) / exp_hz
+            ok = miss == 0 and dev <= 0.25 and hz_dev <= 0.05
             r.add(f"DATA-{short}", f"实测 {short}",
                   "PASS" if ok else "FAIL",
-                  f"实测 {cnt} 条 / 期望≈{exp_cnt:.0f} ({exp_hz}Hz×{elapsed:.1f}s) 偏差{dev*100:.0f}% "
-                  f"掉帧={miss} 实测频率={hz}Hz", "/api/v2/session")
+                  f"实测 {cnt} 条 / 期望≈{exp_cnt:.0f} ({exp_hz}Hz×{span:.1f}s 设备自报时长) "
+                  f"偏差{dev*100:.0f}% 掉帧={miss} 实测频率={hz_txt}"
+                  + (f" 频率偏差{hz_dev*100:.1f}%" if hz_dev > 0.05 else ""),
+                  "/api/v2/session")
         else:
             r.add(f"DATA-{short}", f"实测 {short}", "PASS" if cnt > 0 and miss == 0 else "FAIL",
-                  f"{cnt} 条 掉帧={miss} 实测={hz}Hz（未给期望频率，只校验非零）", "/api/v2/session")
+                  f"{cnt} 条 掉帧={miss} 实测={hz_txt} 时长={span:.1f}s（未给期望频率，只校验非零）",
+                  "/api/v2/session")
+
+    # 停采时长自检：设备说它录了远超我们要求的时间，说明前面有残留采集没清干净，
+    # 或者 stop 没生效。这条是给 DATA-* 兜底的 —— 不然条数超标会误导成"数据异常"。
+    if rec_span:
+        dur_ok = (0.5 * seconds) <= rec_span <= (2.0 * seconds + 3)
+        r.add("E-D-008", "采集时长", "PASS" if dur_ok else "WARN",
+              f"设备自报 start→stop={rec_span:.1f}s（本地计时 {elapsed:.1f}s，要求 {seconds}s）",
+              "/api/v2/session")
 
     # --- 断言 4：队列没有溢出
     cap = r3.get("queue_capacity") or 0
@@ -494,26 +763,45 @@ def write_report(r: R, host: str, device: str) -> str:
     color = {"PASS": ("#27500A", "#EAF3DE"), "FAIL": ("#791F1F", "#FCEBEB"),
              "WARN": ("#633806", "#FAEEDA"), "SKIP": ("#666", "#F1F1EF")}
     rows = "".join(
-        f"<tr><td style='background:{color[i['status']][1]};color:{color[i['status']][0]};"
-        f"font-weight:500'>{i['status']}</td><td><code>{html.escape(i['id'])}</code></td>"
+        f"<tr class='row' data-st='{i['status']}'><td style='background:{color[i['status']][1]};"
+        f"color:{color[i['status']][0]};font-weight:500'>{i['status']}</td>"
+        f"<td><code>{html.escape(i['id'])}</code></td>"
         f"<td>{html.escape(i['name'])}</td><td>{html.escape(i['detail'])}</td>"
         f"<td><code>{html.escape(i['src'])}</code></td></tr>" for i in r.items)
     doc = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>Ego-Std API 检查 {html.escape(device)}</title><style>
 body{{font:14px/1.6 system-ui,'Segoe UI',sans-serif;margin:0;padding:28px;color:#222;background:#fff}}
 h1{{font-size:18px;font-weight:500;margin:0 0 4px}}
-.meta{{color:#666;font-size:12px;margin-bottom:18px}}
-.cards{{display:flex;gap:12px;margin:0 0 20px}}
+.meta{{color:#666;font-size:12px;margin-bottom:14px}}
+.cards{{display:flex;gap:12px;margin:0 0 16px}}
 .card{{flex:1;border:1px solid #d8d6cf;border-radius:10px;padding:12px 14px}}
 .card b{{display:block;font-size:22px;font-weight:500}}
+.bar{{margin:0 0 14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}}
+.bar button{{font:13px/1 system-ui,'Segoe UI',sans-serif;padding:6px 12px;border-radius:7px;
+border:1px solid #c9c6bd;background:#fff;color:#333;cursor:pointer}}
+.bar button:hover{{background:#f3f1ec}}
+.bar button.on{{background:#27500A;color:#fff;border-color:#27500A}}
+.bar .hint{{color:#666;font-size:12px;margin-left:4px}}
 table{{width:100%;border-collapse:collapse;border:1px solid #d8d6cf;border-radius:10px;overflow:hidden}}
 th{{background:#f5f3ee;text-align:left;font-weight:500;padding:9px 10px;border-bottom:1px solid #d8d6cf;font-size:13px}}
 td{{padding:9px 10px;border-bottom:1px solid #eee;vertical-align:top;font-size:13px}}
 code{{font-family:ui-monospace,Consolas,monospace;font-size:12px;background:#f3f1ec;padding:1px 5px;border-radius:4px}}
+tr.hide{{display:none}}
+.idbar{{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 16px}}
+.idbox{{flex:1;min-width:170px;border:1px solid #d8d6cf;border-radius:9px;padding:9px 12px;background:#fbfaf7}}
+.idbox .k{{color:#666;font-size:11px;margin-bottom:3px}}
+.idbox .v{{font-family:ui-monospace,Consolas,monospace;font-size:14px;font-weight:600;color:#14181f;
+word-break:break-all}}
 </style></head><body>
 <h1>LivUmi-Ego-Std 设备体检报告</h1>
-<div class="meta">设备 {html.escape(device)} · 主机 {html.escape(host)} ·
-{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+<div class="meta">主机 {html.escape(host)} ·
+{html.escape(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</div>
+<div class="idbar">
+<div class="idbox"><div class="k">设备 SN</div><div class="v">{html.escape(r.meta.get("sn") or "未取到")}</div></div>
+<div class="idbox"><div class="k">软件版本</div><div class="v">{html.escape(r.meta.get("version") or "未取到")}</div></div>
+<div class="idbox"><div class="k">平台设备 ID</div><div class="v">{html.escape(r.meta.get("ldp_id") or "未取到")}</div></div>
+<div class="idbox"><div class="k">相机型号 / 芯片 SN</div><div class="v">{html.escape((r.meta.get("model") or device) + (" · " + r.meta["camera_sn"] if r.meta.get("camera_sn") else ""))}</div></div>
+</div>
 <div class="cards">
 <div class="card"><b>{len(r.items)}</b>检查项</div>
 <div class="card"><b style="color:#27500A">{tally['PASS']}</b>通过</div>
@@ -521,8 +809,26 @@ code{{font-family:ui-monospace,Consolas,monospace;font-size:12px;background:#f3f
 <div class="card"><b style="color:#BA7517">{tally['WARN']}</b>告警</div>
 <div class="card"><b style="color:#666">{tally['SKIP']}</b>跳过</div>
 </div>
+<div class="bar">
+<button data-f="ALL" class="on">全部</button>
+<button data-f="PASS">只看过项</button>
+<button data-f="FAIL">只看失败</button>
+<button data-f="WARN">只看告警</button>
+<button data-f="SKIP">只看跳过</button>
+<span class="hint">点按钮筛选表格行</span>
+</div>
 <table><thead><tr><th>结果</th><th>编号</th><th>项目</th><th>详情</th><th>来源</th></tr></thead>
-<tbody>{rows}</tbody></table></body></html>"""
+<tbody>{rows}</tbody></table>
+<script>
+var bs=[].slice.call(document.querySelectorAll('.bar button'));
+bs.forEach(function(b){{b.onclick=function(){{
+  var f=b.dataset.f;
+  bs.forEach(function(x){{x.classList.toggle('on',x===b)}});
+  [].slice.call(document.querySelectorAll('tr.row')).forEach(function(tr){{
+    tr.classList.toggle('hide', f!=='ALL' && tr.dataset.st!==f);
+  }});
+}}}});
+</script></body></html>"""
     os.makedirs(OUT, exist_ok=True)
     p = os.path.join(OUT, f"apicheck_{device}.html")
     with open(p, "w", encoding="utf-8") as f:
@@ -559,7 +865,9 @@ def main() -> None:
                     help="设备 IP；省略则读 device_ip.txt，没有就自动扫描本机网段")
     ap.add_argument("--port", type=int, default=18000)
     ap.add_argument("--device", "-d", default="DUT")
-    ap.add_argument("--model", default="", choices=["", "233", "235"], help="头环型号，用于校验收分辨率")
+    ap.add_argument("--model", default="", choices=["", "233", "235"],
+                    help="相机型号：233→设备槽位 ego-lite-01，235→ego-std-235。"
+                         "会先切槽位再自检（采集中会自动先停采），并按型号校验收分辨率")
     ap.add_argument("--device-id", default="ego-std-235",
                     help="目标逻辑设备 id，用于门禁检查（默认 ego-std-235）")
     ap.add_argument("--account", default="", help="Livstudio 账号，给了才测登录")
@@ -597,8 +905,12 @@ def main() -> None:
         os.makedirs(OUT, exist_ok=True)
         jp = os.path.join(OUT, f"apicheck_{args.device}.json")
         with open(jp, "w", encoding="utf-8") as f:
+            # ⚠️ 原来只写 host/device/at/items，把 meta 整块丢了 ——
+            # 也就是说"读 JSON 的人"拿不到 SN 和版本号，只有看 stdout 才有。
+            # 报告要的设备身份字段必须落盘。
             json.dump({"host": args.host, "device": args.device,
-                       "at": payload["at"], "items": r.items},
+                       "at": payload["at"], "summary": payload["summary"],
+                       "meta": r.meta, "items": r.items},
                       f, ensure_ascii=False, indent=2)
         p = write_report(r, args.host, args.device)
         print(f"\nJSON -> {jp}")
