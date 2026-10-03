@@ -77,6 +77,77 @@ def main() -> None:
     check(p._checked_ips() == [p.list.item(i).text() for i in range(n)],
           "默认全勾选")
 
+    # --- 各「设备来源」解析 ---
+    src_idx = {p.src.itemData(i): i for i in range(p.src.count())}
+    check(set(src_idx) >= {"discover", "range", "net", "file", "manual"},
+          f"来源下拉含全部选项：{sorted(src_idx)}")
+
+    # 自动扫描：有清单时直接用清单
+    p.src.setCurrentIndex(src_idx["discover"])
+    ips, err = p._resolve_src()
+    check(not err and ips == [], "自动扫描模式：有清单时沿用清单，不重复扫")
+
+    # IP 范围：取一台真实在线设备的所在段
+    online = p._checked_ips()
+    if online:
+        target = online[0]
+        o = target.rsplit(".", 1)
+        p.src.setCurrentIndex(src_idx["range"])
+        p.path.setText(f"{o[0]}.{o[1]}-{int(o[1]) + 2}")
+        ips, err = p._resolve_src()
+        check(not err and target in ips,
+              f"IP 范围 {o[0]}.{o[1]}-{int(o[1]) + 2} 解析出 {len(ips)} 台，含 {target}")
+
+    # IP 范围：格式错误要给出提示而不是崩
+    p.path.setText("192.168.195")
+    ips, err = p._resolve_src()
+    check(bool(err) and not ips, f"范围格式错误被拦下：{err[:40]}")
+
+    # IP 范围：探不到设备的段
+    p.path.setText("192.168.199.1-3")
+    ips, err = p._resolve_src()
+    check(bool(err), "探不到设备时给出提示")
+
+    # 指定网段
+    p.src.setCurrentIndex(src_idx["net"])
+    p.path.setText("192.168.195")
+    ips, err = p._resolve_src()
+    check(not err and len(ips) > 0, f"指定网段 192.168.195 解析出 {len(ips)} 台")
+
+    # 指定网段：格式错误
+    p.path.setText("not-a-net")
+    ips, err = p._resolve_src()
+    check(bool(err), f"网段格式错误被拦下：{err[:40]}")
+
+    # 手动输入
+    p.src.setCurrentIndex(src_idx["manual"])
+    p.path.setText("192.168.195.21, 192.168.195.44")
+    ips, err = p._resolve_src()
+    check(not err and ips == ["192.168.195.21", "192.168.195.44"],
+          f"手动输入解析：{ips}")
+
+    # 手动输入：混入非 IP
+    p.path.setText("192.168.195.21, garbage")
+    ips, err = p._resolve_src()
+    check(bool(err), f"手动输入含非法项被拦下：{err[:40]}")
+
+    # 清单文件
+    p.src.setCurrentIndex(src_idx["file"])
+    p.path.setText(str(OUT / "ips.txt"))
+    OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / "ips.txt").write_text("# 测试清单\n192.168.195.21\n\n192.168.195.44\n",
+                                 encoding="utf-8")
+    ips, err = p._resolve_src()
+    check(not err and ips == ["192.168.195.21", "192.168.195.44"],
+          f"清单文件解析（跳过 # 注释与空行）：{ips}")
+
+    # 回到自动扫描，清空重扫
+    p.src.setCurrentIndex(src_idx["discover"])
+    p.list.clear()
+    p.scan_devices()
+    check(p.list.count() > 0, f"重新扫描回到 {p.list.count()} 台")
+
+    online = p._checked_ips()
     # 取消勾选一部分（最多一半，且至少留 1 台），验证「只测勾选的」
     p._check_all(True)
     drop = min(n // 2, max(0, n - 1))

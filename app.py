@@ -86,6 +86,17 @@ def probe_host(ip: str, port: int = 18000, timeout: float = 1.5) -> bool:
         return False
 
 
+def _probe(ip: str, port: int = 18000, timeout: float = 2.0) -> bool:
+    """IP 范围探测用：拉一次 /api/v2/health，通了才算设备。"""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(
+                f"http://{ip}:{port}/api/v2/health", timeout=timeout) as r:
+            return r.status == 200
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # ------------------------------------------------------------------ 进程封装
 
 class Runner(QObject):
@@ -493,8 +504,13 @@ class BatchPanel(Panel):
         g.addWidget(QLabel("设备来源"), 0, 0)
         self.src = QComboBox()
         self.src.addItem("自动扫描本机网段", "discover")
+        self.src.addItem("IP 范围（如 192.168.195.20-30）", "range")
+        self.src.addItem("指定网段（如 192.168.199）", "net")
         self.src.addItem("设备清单文件（每行一个 IP）", "file")
         self.src.addItem("手动输入（逗号分隔）", "manual")
+        self.src.setToolTip(
+            "「IP 范围」最快：设备连号时只探这一段，不会扫全网段 254 个地址。\n"
+            "「指定网段」用于设备不在本机网段的情况（比如接了交换机/另一个 WiFi）。")
         g.addWidget(self.src, 0, 1)
 
         g.addWidget(QLabel("头环型号"), 0, 2)
@@ -521,9 +537,8 @@ class BatchPanel(Panel):
         self.timeout.setToolTip("超时就跳过这台，不让一台卡死拖住整批。")
         g.addWidget(self.timeout, 1, 3)
 
-        # 手动输入 / 文件路径
+        # 手动输入 / 文件路径 / 网段 / 范围
         self.path = QLineEdit()
-        self.path.setPlaceholderText("清单文件路径，或逗号分隔的 IP：192.168.195.21,192.168.195.44")
         self.path.setVisible(False)
         g.addWidget(self.path, 2, 0, 1, 4)
         self.src.currentIndexChanged.connect(self._sync_src)
@@ -641,8 +656,19 @@ class BatchPanel(Panel):
         QTimer.singleShot(200, self.scan_devices)
 
     # --- 参数区联动 -------------------------------------------------
+    PLACEHOLDERS = {
+        "discover": "",
+        "range": "IP 范围，如 192.168.195.20-30（设备连号时最快，只探这一段）",
+        "net": "网段前缀，如 192.168.199（设备不在本机网段时用）",
+        "file": "清单文件路径，每行一个 IP，# 开头是注释",
+        "manual": "逗号分隔的 IP，如 192.168.195.21,192.168.195.44",
+    }
+
     def _sync_src(self, _idx: int) -> None:
-        self.path.setVisible(self.src.currentData() != "discover")
+        kind = self.src.currentData()
+        self.path.setText("")           # 换来源就清掉上次的输入，免得串味
+        self.path.setPlaceholderText(self.PLACEHOLDERS.get(kind, ""))
+        self.path.setVisible(kind != "discover")
 
     # --- 设备清单 ---------------------------------------------------
     def _check_all(self, on: bool) -> None:
@@ -667,16 +693,61 @@ class BatchPanel(Panel):
                 out.append(it.text().strip())
         return out
 
+    def _resolve_src(self) -> tuple[list[str], str]:
+        """按当前「设备来源」解析出待测 IP 列表。返回 (ips, 错误信息)，出错时 ips 为空。"""
+        import batch_check
+        kind = self.src.currentData()
+        p = self.path.text().strip()
+
+        if kind == "discover":
+            if self.list.count() > 0:
+                return [], ""            # 已有扫描结果，直接用清单
+            return self._scan_sync(), ""
+
+        if not p:
+            return [], f"请在右侧填「{self.src.currentText()}」"
+
+        try:
+            if kind == "range":
+                cand = batch_check.parse_range(p)
+                alive = [ip for ip in cand if _probe(ip)]
+                msg = f"范围 {p}：{len(cand)} 个地址，探出 {len(alive)} 台设备"
+                return alive, "" if alive else f"{msg}\n没探到设备，确认地址段写对了"
+            if kind == "net":
+                devices, _, _, nets = __import__("devip").discover(
+                    nets=[batch_check.parse_net(p)], timeout=0.3)
+                ips = [d["ip"] for d in devices]
+                return ips, "" if ips else f"网段 {nets} 里没找到 ego 设备"
+            if kind == "file":
+                ips = batch_check.read_ip_file(p)
+                return ips, "" if ips else f"{p} 里没读到 IP"
+            # manual
+            if re.match(r"^\d+\.\d+\.\d+\.\d+$", p) and "," not in p:
+                return [p], ""
+            ips = [x.strip() for x in p.replace("，", ",").split(",") if x.strip()]
+            bad = [x for x in ips if not re.match(r"^\d+\.\d+\.\d+\.\d+$", x)]
+            if bad:
+                return [], f"这些不像 IP：{', '.join(bad[:5])}"
+            return ips, ""
+        except ValueError as e:
+            return [], f"参数写错了：{e}"
+        except Exception as e:  # noqa: BLE001
+            return [], f"{type(e).__name__}: {e}"
+
+    def _scan_sync(self) -> list[str]:
+        code, out = run_sync(["find_device.py", "--list", "--timeout", "0.3"])
+        return [l.strip() for l in out.splitlines()
+                if l.strip() and re.match(r"^\d+\.\d+\.\d+\.\d+$", l.strip())]
+
     def scan_devices(self) -> None:
-        """后台扫网段。这里必须异步 —— 扫描 254 个端口要几秒，同步会冻住界面。"""
+        """扫描本机网段，把设备加进清单。"""
         self.prog_text.setText("正在扫描本机网段…")
         QApplication.processEvents()
-        code, out = run_sync(["find_device.py", "--list", "--timeout", "0.3"])
-        ips = [l.strip() for l in out.splitlines()
-               if l.strip() and re.match(r"^\d+\.\d+\.\d+\.\d+$", l.strip())]
+        ips = self._scan_sync()
         self._set_devices(ips)
         if not ips:
-            self.prog_text.setText("没扫到设备。确认设备和电脑在同一网段，或改用「设备清单文件」")
+            self.prog_text.setText("没扫到设备。确认设备和电脑在同一网段，"
+                                   "或在上方改用「IP 范围」/「指定网段」")
         else:
             n0 = load_device_ip()
             if n0 and n0 not in ips:
@@ -687,25 +758,20 @@ class BatchPanel(Panel):
 
     # --- 运行 -------------------------------------------------------
     def on_run(self) -> None:
-        if self.src.currentData() != "discover":
-            # 文件 / 手动：先解析再决定要不要跑
-            p = self.path.text().strip()
-            if not p:
-                self.prog_text.setText("请填写文件路径或 IP 列表")
+        if self.src.currentData() != "discover" or not self.list.count():
+            # 非自动扫描模式，或自动扫描但清单空 —— 先按来源解析出设备
+            ips, err = self._resolve_src()
+            if err:
+                self.prog_text.setText(err)
+                self.append(f"<b style='color:#c62828'>{err}</b>")
                 return
-            if "," in p or re.match(r"^\d+\.\d+\.\d+\.\d+$", p):
-                ips = [x.strip() for x in p.replace("，", ",").split(",") if x.strip()]
-            else:
-                try:
-                    import batch_check
-                    ips = batch_check.read_ip_file(p)
-                except Exception as e:  # noqa: BLE001
-                    self.prog_text.setText(f"读文件失败：{e}")
-                    return
-                if not ips:
-                    self.prog_text.setText("文件里没读到 IP")
-                    return
+            if not ips:
+                self.prog_text.setText("没解析出可测设备")
+                return
             self._set_devices(ips)
+            if len(ips) <= 20:
+                self.append(f"按「{self.src.currentText()}」解析出 {len(ips)} 台："
+                            f"{', '.join(ips)}")
 
         ips = self._checked_ips()
         if not ips:

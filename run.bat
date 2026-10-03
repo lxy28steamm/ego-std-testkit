@@ -94,7 +94,7 @@ goto pause
 :c6
 chcp 65001 >nul
 set "BIPS="
-set /p "BIPS=设备IP(留空=自动扫描本机网段, 多台用逗号分隔): "
+set /p "BIPS=设备(留空=自动扫描本机网段; 范围如 192.168.195.20-30; 多台逗号分隔): "
 set "BW=5"
 set /p "BW=并发数(默认5, 3-10为宜): "
 if "%BW%"=="" set "BW=5"
@@ -102,7 +102,7 @@ echo 正在批量巡检，请稍候...
 if "%BIPS%"=="" (
   "%PY%" batch_check.py --discover --workers %BW%
 ) else (
-  "%PY%" batch_check.py --ip "%BIPS%" --workers %BW%
+  "%PY%" batch_check.py --ip-list "%BIPS%" --workers %BW%
 )
 chcp 936 >nul
 goto pause

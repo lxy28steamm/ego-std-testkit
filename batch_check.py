@@ -27,6 +27,7 @@ import csv
 import html
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -37,6 +38,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(BASE_DIR, "out")
 DEVICE_FILE = os.path.join(BASE_DIR, "device_ip.txt")
 ENGINE = os.path.join(BASE_DIR, "ego_api_test.py")
+API_PORT_DEFAULT = 18000
 
 sys.path.insert(0, BASE_DIR)
 
@@ -65,9 +67,90 @@ def read_ip_file(path: str) -> list[str]:
     return out
 
 
+def parse_net(s: str) -> str:
+    """网段前缀归一化：192.168.199 / 192.168.199.0/24 -> 192.168.199"""
+    s = str(s).strip().rstrip("/")
+    if s.endswith(".0/24"):
+        s = s[:-5]
+    parts = s.split(".")
+    if len(parts) == 4 and parts[3] in ("0", ""):
+        parts = parts[:3]
+    if len(parts) != 3:
+        raise ValueError(f"网段格式不对：{s}（应写 192.168.199 或 192.168.199.0/24）")
+    return ".".join(parts)
+
+
+def parse_range(s: str, base_hint: str = "") -> list[str]:
+    """IP 范围 -> IP 列表。支持这些写法：
+
+        192.168.195.20-30                    同网段内一段（最常用，设备连号时省事）
+        192.168.195.20-192.168.195.30        完整写法
+        192.168.195.10-30,50-60              多段并列，后段继承前缀
+        10-12                                纯主机号，前缀继承 base_hint
+    """
+    out: list[str] = []
+    base = base_hint
+    for part in re_split_commas(s):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" not in part:
+            # 单个 IP：10-12,20 里的那个 20。写全了就直接用，
+            # 只写主机号就继承前缀（常见于 20-30,44,47 这种写法）
+            if part.count(".") == 3:
+                host = int(part.split(".")[3])
+                if not 1 <= host <= 254:
+                    raise ValueError(f"主机号必须在 1-254：{part}")
+                out.append(part)
+                base = ".".join(part.split(".")[:3])
+                continue
+            if base and part.isdigit() and 1 <= int(part) <= 254:
+                out.append(f"{base}.{part}")
+                continue
+            raise ValueError(f"范围格式不对：{part}（应写 192.168.195.20-30）")
+        a, b = (x.strip() for x in part.split("-", 1))
+        if a.count(".") == 3:
+            base = ".".join(a.split(".")[:3])       # 本段给出了完整 IP，前缀随之更新
+        if a.count(".") != 3:
+            if not base:
+                raise ValueError(f"IP 不完整：{part}（第一段要写全，如 192.168.195.1-3）")
+            a = f"{base}.{a}"                       # 简写：20-30
+        if b.count(".") != 3:
+            b = f"{base}.{b}"
+        pa, pb = a.split("."), b.split(".")
+        if pa[:3] != pb[:3]:
+            raise ValueError(f"暂不支持跨网段范围：{part}（{a} 和 {b} 不在同一网段）")
+        i, j = int(pa[3]), int(pb[3])
+        if not (1 <= i <= j <= 254):
+            raise ValueError(f"主机号必须在 1-254：{part}")
+        pre = ".".join(pa[:3])
+        out += [f"{pre}.{k}" for k in range(i, j + 1)]
+    return out
+
+
+def smart_list(s: str, verbose: bool = True) -> list[str]:
+    """一个字符串自动分流成 IP 列表 —— 供 run.bat 和「懒得区分参数」的场景用。
+
+        192.168.195.20-30            -> 范围（先探 API，只留真设备）
+        192.168.195.21,192.168.195.44 -> IP 列表（原样）
+        192.168.195.21               -> 单台
+    """
+    s = str(s).strip().replace("，", ",")
+    if not s:
+        return []
+    if "-" in s and re.match(r"^\d+\.\d+\.\d+\.\d+\s*-\s*\d+$", s.split(",")[0].strip()):
+        return collect_ips(ranges=s, verbose=verbose)
+    return [x.strip() for x in re_split_commas(s)]
+
+
 def collect_ips(ip_arg: str = "", file_arg: str = "", discover: bool = False,
+                nets: list[str] | None = None, ranges: str = "",
                 verbose: bool = True) -> list[str]:
-    """按 --ip / --file / --discover / device_ip.txt 的优先级收集设备 IP（去重、保序）。"""
+    """按 --ip / --file / --range / --discover / device_ip.txt 收集设备 IP（去重、保序）。
+
+    nets  非空时只扫这些网段（--net 可重复），否则扫本机所在网段
+    ranges  IP 范围，如 192.168.195.20-30，会逐个探 API 不做全段端口扫描
+    """
     ips: list[str] = []
 
     def add(s: str) -> None:
@@ -79,11 +162,23 @@ def collect_ips(ip_arg: str = "", file_arg: str = "", discover: bool = False,
         add(s)
     for s in (read_ip_file(file_arg) if file_arg else []):
         add(s)
-    if discover:
+    if ranges:
+        # --range 给的是一段地址，里面大概率混着非设备主机。先快速探一下 API，
+        # 只把「拉得通 /api/v2/health」的留下，避免最终表格里 90% 都是「连不上」。
+        cand = parse_range(ranges)
         import devip
-        devices, _, _, nets = devip.discover()
+        alive = [ip for ip in cand if devip.http_json(
+            f"http://{ip}:{API_PORT_DEFAULT}/api/v2/health", timeout=2.0)]
         if verbose:
-            print(f"扫描网段 {nets}  发现 {len(devices)} 台 ego 设备")
+            print(f"范围 {ranges}：{len(cand)} 个地址，探出 {len(alive)} 台设备")
+        for s in alive:
+            add(s)
+    if discover or nets:
+        import devip
+        target_nets = [parse_net(n) for n in (nets or [])] or None
+        devices, _, _, scanned = devip.discover(nets=target_nets)
+        if verbose:
+            print(f"扫描网段 {scanned}  发现 {len(devices)} 台 ego 设备")
         for d in devices:
             add(d["ip"])
     if not ips:
@@ -414,8 +509,19 @@ def main() -> None:
     _fix_console()
     ap = argparse.ArgumentParser(description="Ego-Std 批量巡检（多台设备并发体检）")
     ap.add_argument("--ip", default="", help="逗号分隔的 IP 列表")
+    ap.add_argument("--ip-list", default="",
+                    help="一个字符串搞定：范围(192.168.195.20-30) 或 "
+                         "列表(192.168.195.21,192.168.195.44) 都能认，"
+                         "按内容自动分流。run.bat 用这个")
     ap.add_argument("--file", default="", help="IP 清单文件（每行一个，# 注释）")
     ap.add_argument("--discover", action="store_true", help="自动扫描本机网段全部 ego 设备")
+    ap.add_argument("--net", action="append", default=[],
+                    metavar="SEG",
+                    help="指定网段前缀（可重复），如 --net 192.168.199。"
+                         "给了就只扫这些网段，不扫本机网段")
+    ap.add_argument("--range", default="", metavar="A-B",
+                    help="IP 范围，如 192.168.195.20-30（设备连号时最快，"
+                         "只探这段不扫全段）；多段用逗号并列")
     ap.add_argument("--workers", type=int, default=5, help="并发数（默认 5）")
     ap.add_argument("--timeout", type=int, default=180, help="单台超时秒数（默认 180）")
     ap.add_argument("--port", type=int, default=18000)
@@ -431,9 +537,17 @@ def main() -> None:
     ap.add_argument("--no-report", action="store_true", help="不导出任何报告文件")
     args = ap.parse_args()
 
-    ips = collect_ips(args.ip, args.file, args.discover)
+    try:
+        if args.ip_list:
+            ips = smart_list(args.ip_list)
+        else:
+            ips = collect_ips(args.ip, args.file, args.discover, args.net, args.range)
+    except ValueError as e:
+        print(f"参数写错了：{e}")
+        sys.exit(2)
     if not ips:
-        print("没有可测设备。用 --ip / --file / --discover 指定，或先跑一次自动查找。")
+        print("没有可测设备。用 --ip / --file / --range / --net / --discover 指定，"
+              "或先跑一次自动查找。")
         sys.exit(2)
 
     print(f"批量巡检 {len(ips)} 台，并发 {min(args.workers, len(ips))}，"
