@@ -1,0 +1,9 @@
+# Windows 批处理必须是 CRLF + GBK。仓库里统一按二进制处理，
+# 避免 autocrlf 把 .bat 转成 LF —— LF 的 .bat 在部分环境下会解析异常。
+*.bat binary
+*.ps1 binary
+
+# Python 源码：仓库内存 LF，检出时按平台转换
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf

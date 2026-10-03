@@ -18,16 +18,17 @@ import os
 import re
 import sys
 import json
+from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, QObject, Signal, QSize
+from PySide6.QtCore import Qt, QProcess, QProcessEnvironment, QObject, Signal, QSize, QThread, QTimer
 from PySide6.QtGui import QFont, QColor, QTextCursor, QPixmap, QPainter
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QCheckBox, QComboBox, QSpinBox, QDoubleSpinBox,
     QPlainTextEdit, QTableWidget, QTableWidgetItem, QListWidget, QListWidgetItem,
     QStackedWidget, QSplitter, QGroupBox, QFrame, QFileDialog, QMessageBox,
-    QHeaderView, QStatusBar, QSizePolicy, QAbstractItemView,
+    QHeaderView, QStatusBar, QSizePolicy, QAbstractItemView, QProgressBar,
 )
 
 BASE = Path(__file__).resolve().parent
@@ -453,8 +454,443 @@ class CheckupPanel(Panel):
         self.banner.setVisible(True)
 
 
+class BatchWorker(QObject):
+    """在后台线程里跑批量巡检，通过信号把进度抛回界面。"""
+
+    progress = Signal(int, int, str, str, str)   # done, total, ip, verdict, 秒数
+    done = Signal(list)                          # 全部结果
+    failed = Signal(str)                         # 出错信息
+
+    def __init__(self, ips, workers, timeout, do_collect, model, device_id):
+        super().__init__()
+        self.ips, self.workers, self.timeout = ips, workers, timeout
+        self.do_collect, self.model, self.device_id = do_collect, model, device_id
+
+    def run(self) -> None:
+        try:
+            import batch_check
+
+            def cb(done: int, total: int, rec: dict) -> None:
+                self.progress.emit(done, total, rec["ip"],
+                                   rec["verdict"], str(rec["secs"]))
+
+            recs = batch_check.run_batch(
+                self.ips, self.workers, self.timeout,
+                self.do_collect, self.model, self.device_id, on_progress=cb)
+            self.done.emit(recs)
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+class BatchPanel(Panel):
+    title = "② 批量巡检"
+    desc = ("一次给一整批设备（17 台 / 整间实验室）跑同一套体检，并发执行，"
+            "结束后出一张总表：谁的版本落后、谁没接相机、谁不合格，一眼挑完。")
+
+    def build_controls(self) -> None:
+        g = self.ctrl_layout
+
+        g.addWidget(QLabel("设备来源"), 0, 0)
+        self.src = QComboBox()
+        self.src.addItem("自动扫描本机网段", "discover")
+        self.src.addItem("设备清单文件（每行一个 IP）", "file")
+        self.src.addItem("手动输入（逗号分隔）", "manual")
+        g.addWidget(self.src, 0, 1)
+
+        g.addWidget(QLabel("头环型号"), 0, 2)
+        self.model = QComboBox()
+        self.model.addItem("不校验", "")
+        self.model.addItem("233（1080P）", "233")
+        self.model.addItem("235（2K）", "235")
+        self.model.setCurrentIndex(2)
+        self.model.setFixedWidth(140)
+        g.addWidget(self.model, 0, 3)
+
+        g.addWidget(QLabel("并发数"), 1, 0)
+        self.workers = QSpinBox()
+        self.workers.setRange(1, 20)
+        self.workers.setValue(5)
+        self.workers.setToolTip("同时测几台。网口/交换机扛得住可以调到 8-10；\n"
+                                 "WiFi 环境建议 3-5，太高会互相抢带宽反而变慢。")
+        g.addWidget(self.workers, 1, 1)
+
+        g.addWidget(QLabel("单台超时（秒）"), 1, 2)
+        self.timeout = QSpinBox()
+        self.timeout.setRange(30, 1800)
+        self.timeout.setValue(180)
+        self.timeout.setToolTip("超时就跳过这台，不让一台卡死拖住整批。")
+        g.addWidget(self.timeout, 1, 3)
+
+        # 手动输入 / 文件路径
+        self.path = QLineEdit()
+        self.path.setPlaceholderText("清单文件路径，或逗号分隔的 IP：192.168.195.21,192.168.195.44")
+        self.path.setVisible(False)
+        g.addWidget(self.path, 2, 0, 1, 4)
+        self.src.currentIndexChanged.connect(self._sync_src)
+
+        self.do_collect = QCheckBox("实测一轮采集（会往设备写文件，约 30 秒/台）")
+        g.addWidget(self.do_collect, 3, 0, 1, 2)
+
+        self.chk_fail_only = QCheckBox("只导出不合格设备明细")
+        self.chk_fail_only.setToolTip("交付场景常用：只列需要跟进的机器。")
+        g.addWidget(self.chk_fail_only, 3, 2)
+
+        g.setColumnStretch(1, 0)
+        g.setColumnStretch(3, 1)
+        g.setColumnMinimumWidth(2, 90)
+
+    def build_middle(self, root) -> None:
+        # 批量页的「停止」要停自己的 QThread，不是基类那个单进程 Runner
+        self.btn_stop.clicked.disconnect()
+        self.btn_stop.clicked.connect(self._stop)
+
+        # --- 汇总 banner ---
+        self.banner = QLabel("")
+        self.banner.setVisible(False)
+        self.banner.setWordWrap(True)
+        root.addWidget(self.banner)
+
+        # --- 设备清单（带复选框）---
+        list_row = QHBoxLayout()
+        list_row.setSpacing(8)
+        list_row.addWidget(QLabel("设备清单"))
+        self.list = QListWidget()
+        self.list.setMaximumHeight(120)
+        self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list.setStyleSheet(
+            "QListWidget{border:1px solid #d9dee6;border-radius:6px;background:#fff;font-size:13px}"
+            "QListWidget::item{height:26px;padding-left:6px}"
+        )
+        list_row.addWidget(self.list, 1)
+
+        btns = QVBoxLayout()
+        btns.setSpacing(4)
+        b_scan = QPushButton("扫描")
+        b_scan.setFixedHeight(28)
+        b_scan.setToolTip("扫描本机网段，把所有 ego 设备加进清单（全量，不是只找一台）")
+        b_scan.clicked.connect(self.scan_devices)
+        btns.addWidget(b_scan)
+        b_all = QPushButton("全选")
+        b_all.setFixedHeight(28)
+        b_all.clicked.connect(lambda: self._check_all(True))
+        btns.addWidget(b_all)
+        b_none = QPushButton("全不选")
+        b_none.setFixedHeight(28)
+        b_none.clicked.connect(lambda: self._check_all(False))
+        btns.addWidget(b_none)
+        list_row.addLayout(btns)
+        root.addLayout(list_row)
+
+        # --- 进度条 ---
+        self.prog = QProgressBar()
+        self.prog.setFixedHeight(16)
+        self.prog.setTextVisible(False)
+        self.prog.setStyleSheet(
+            "QProgressBar{background:#eef0f3;border:none;border-radius:8px}"
+            "QProgressBar::chunk{background:#1f6feb;border-radius:8px}"
+        )
+        root.addWidget(self.prog)
+        self.prog_text = QLabel("待开始")
+        self.prog_text.setStyleSheet("color:#5b6472;font-size:12px")
+        root.addWidget(self.prog_text)
+
+        # --- 结果表 ---
+        self.table = QTableWidget(0, 9)
+        self.table.setHorizontalHeaderLabels(
+            ["IP", "结论", "版本", "状态", "相机", "通过", "失败", "告警", "耗时"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setShowGrid(False)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.Fixed)
+        self.table.setColumnWidth(0, 128)
+        for c in (1, 2, 3, 4, 5, 6, 7, 8):
+            hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        self.table.setMaximumHeight(0)
+        root.addWidget(self.table)
+
+        # --- 导出按钮 ---
+        exp = QHBoxLayout()
+        exp.setSpacing(8)
+        b_html = QPushButton("导出 HTML 报告")
+        b_html.setFixedHeight(30)
+        b_html.clicked.connect(lambda: self._export("html"))
+        exp.addWidget(b_html)
+        b_xlsx = QPushButton("导出 Excel")
+        b_xlsx.setFixedHeight(30)
+        b_xlsx.clicked.connect(lambda: self._export("xlsx"))
+        exp.addWidget(b_xlsx)
+        b_csv = QPushButton("导出 CSV")
+        b_csv.setFixedHeight(30)
+        b_csv.clicked.connect(lambda: self._export("csv"))
+        exp.addWidget(b_csv)
+        b_open = QPushButton("打开输出目录")
+        b_open.setFixedHeight(30)
+        b_open.clicked.connect(self._open_out)
+        exp.addWidget(b_open)
+        exp.addStretch(1)
+        root.addLayout(exp)
+
+        self._recs: list[dict] = []
+        self._summary: dict = {}
+        self._thread: QThread | None = None
+        self._worker: BatchWorker | None = None
+
+        # 启动即扫一次，省得每次都点
+        QTimer.singleShot(200, self.scan_devices)
+
+    # --- 参数区联动 -------------------------------------------------
+    def _sync_src(self, _idx: int) -> None:
+        self.path.setVisible(self.src.currentData() != "discover")
+
+    # --- 设备清单 ---------------------------------------------------
+    def _check_all(self, on: bool) -> None:
+        for i in range(self.list.count()):
+            self.list.item(i).setCheckState(Qt.Checked if on else Qt.Unchecked)
+
+    def _set_devices(self, ips: list[str]) -> None:
+        self.list.clear()
+        for ip in ips:
+            it = QListWidgetItem(ip)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(Qt.Checked)
+            self.list.addItem(it)
+        self.prog_text.setText(
+            f"清单 {len(ips)} 台，全部勾选" if ips else "清单是空的，先点「扫描」")
+
+    def _checked_ips(self) -> list[str]:
+        out = []
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            if it.checkState() == Qt.Checked:
+                out.append(it.text().strip())
+        return out
+
+    def scan_devices(self) -> None:
+        """后台扫网段。这里必须异步 —— 扫描 254 个端口要几秒，同步会冻住界面。"""
+        self.prog_text.setText("正在扫描本机网段…")
+        QApplication.processEvents()
+        code, out = run_sync(["find_device.py", "--list", "--timeout", "0.3"])
+        ips = [l.strip() for l in out.splitlines()
+               if l.strip() and re.match(r"^\d+\.\d+\.\d+\.\d+$", l.strip())]
+        self._set_devices(ips)
+        if not ips:
+            self.prog_text.setText("没扫到设备。确认设备和电脑在同一网段，或改用「设备清单文件」")
+        else:
+            n0 = load_device_ip()
+            if n0 and n0 not in ips:
+                self.prog_text.setText(
+                    f"扫到 {len(ips)} 台。注意：当前设备栏的 {n0} 不在其中")
+            else:
+                self.prog_text.setText(f"扫到 {len(ips)} 台，已全部勾选")
+
+    # --- 运行 -------------------------------------------------------
+    def on_run(self) -> None:
+        if self.src.currentData() != "discover":
+            # 文件 / 手动：先解析再决定要不要跑
+            p = self.path.text().strip()
+            if not p:
+                self.prog_text.setText("请填写文件路径或 IP 列表")
+                return
+            if "," in p or re.match(r"^\d+\.\d+\.\d+\.\d+$", p):
+                ips = [x.strip() for x in p.replace("，", ",").split(",") if x.strip()]
+            else:
+                try:
+                    import batch_check
+                    ips = batch_check.read_ip_file(p)
+                except Exception as e:  # noqa: BLE001
+                    self.prog_text.setText(f"读文件失败：{e}")
+                    return
+                if not ips:
+                    self.prog_text.setText("文件里没读到 IP")
+                    return
+            self._set_devices(ips)
+
+        ips = self._checked_ips()
+        if not ips:
+            self.prog_text.setText("一台都没勾 —— 请先扫描并勾选设备")
+            return
+
+        self.out.clear()
+        self.table.setRowCount(0)
+        self.table.setMaximumHeight(0)
+        self.banner.setVisible(False)
+        self._recs, self._summary = [], {}
+        self.prog.setRange(0, len(ips))
+        self.prog.setValue(0)
+
+        self.btn_run.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.append(f"批量巡检 {len(ips)} 台，并发 {min(self.workers.value(), len(ips))}，"
+                    f"单台超时 {self.timeout.value()}s，"
+                    f"{'含实测采集' if self.do_collect.isChecked() else '只读不启停采集'}")
+
+        self._thread = QThread(self)
+        self._worker = BatchWorker(
+            ips, self.workers.value(), self.timeout.value(),
+            self.do_collect.isChecked(), self.model.currentData(), "")
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.done.connect(self._on_done)
+        self._worker.failed.connect(self._on_failed)
+        self._thread.start()
+
+    def build_args(self) -> list[str]:
+        # 批量页自己管线程（run_batch 要并发 + 进度回调），不走基类的 QProcess 路径。
+        # 这里返回空列表，避免基类的 on_run 被误用。
+        return []
+
+    def _stop(self) -> None:
+        if self._thread and self._thread.isRunning():
+            self.append("<b style='color:#c62828'>[已请求停止] 已在测的设备跑完就收工</b>")
+            self._thread.quit()
+            self._thread.wait(3000)
+        self._restore()
+
+    def _restore(self) -> None:
+        self.btn_run.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+
+    def _banner(self, text: str, bg: str, fg: str) -> None:
+        self.banner.setText(text)
+        self.banner.setStyleSheet(
+            f"background:{bg};color:{fg};border-radius:8px;padding:12px 16px;"
+            f"font-size:15px;font-weight:600"
+        )
+        self.banner.setVisible(True)
+
+    def _on_progress(self, done: int, total: int, ip: str, verdict: str, secs: str) -> None:
+        self.prog.setValue(done)
+        color = {"PASS": C_OK, "WARN": C_WARN}.get(verdict, C_BAD)
+        self.append(f"  <span style='color:{color}'>[{done}/{total}] {verdict:<4}</span> "
+                    f"{ip}  {secs}s")
+        self.prog_text.setText(f"进行中 {done}/{total}　最近：{ip} → {verdict}")
+
+    def _on_done(self, recs: list) -> None:
+        import batch_check
+        self._recs = recs
+        self._summary = batch_check.summarize_batch(recs)
+        self._fill_table(recs)
+        self.table.setMaximumHeight(250)
+        self.prog.setValue(len(recs))
+
+        s = self._summary
+        self.prog_text.setText(
+            f"完成 {s['total']} 台：合格 {s['PASS']} / 告警 {s['WARN']} / 不合格 {s['FAIL']}")
+
+        if s["FAIL"] == 0 and s["WARN"] == 0:
+            self._banner(f"✔ 全部通过　{s['total']} 台 18 项全绿 —— 可以整批交付",
+                         BG_OK, C_OK)
+        elif s["FAIL"] == 0:
+            self._banner(f"✔ 无不合格　{s['total']} 台中 {s['PASS']} 台通过、"
+                         f"{s['WARN']} 台有告警（不阻断交付）", BG_WARN, C_WARN)
+        else:
+            self._banner(f"✘ {s['FAIL']} 台不合格　（共 {s['total']} 台）"
+                         f"　—— 点下面表格里的行看失败项，再导出明细发给开发",
+                         BG_BAD, C_BAD)
+
+        color = C_BAD if s["FAIL"] else C_OK
+        self.append(f"\n<b style='color:{color}'>—— 批量巡检结束："
+                    f"合格 {s['PASS']} / 告警 {s['WARN']} / 不合格 {s['FAIL']} ——</b>")
+        if s["FAIL"]:
+            self.append("下一步：点「导出 Excel」拿到失败明细，按 IP 对号入座。")
+        else:
+            self.append("下一步：点「导出 HTML 报告」存档，作为交付记录。")
+
+        if self._thread:
+            self._thread.quit()
+            self._thread.wait(5000)
+        self._restore()
+        if self.chk_shutdown.isChecked():
+            self.chk_shutdown.setChecked(False)
+            self._do_shutdown()
+
+    def _on_failed(self, msg: str) -> None:
+        self.append(f"<b style='color:#c62828'>[批量巡检异常] {msg}</b>")
+        if self._thread:
+            self._thread.quit()
+            self._thread.wait(3000)
+        self._restore()
+
+    def _fill_table(self, recs: list) -> None:
+        self.table.setRowCount(len(recs))
+        for r, rec in enumerate(recs):
+            verdict = rec["verdict"]
+            bg = {"PASS": BG_OK, "WARN": BG_WARN}.get(verdict, BG_BAD)
+            fg = {"PASS": C_OK, "WARN": C_WARN}.get(verdict, C_BAD)
+            cells = [
+                rec["ip"],
+                verdict,
+                rec.get("version") or "-",
+                str(rec.get("state") or "-")[:12],
+                str(rec.get("cameras", "")),
+                rec["PASS"], rec["FAIL"], rec["WARN"],
+                f"{rec['secs']}s",
+            ]
+            for c, v in enumerate(cells):
+                it = QTableWidgetItem(str(v))
+                it.setBackground(QColor(bg))
+                it.setForeground(QColor(fg if c in (0, 1) else "#1f2530"))
+                if c in (0, 1, 5, 6, 7, 8):
+                    it.setTextAlignment(Qt.AlignCenter)
+                f = it.font()
+                if c == 1:
+                    f.setBold(True)
+                    it.setFont(f)
+                self.table.setItem(r, c, it)
+
+    # --- 导出 -------------------------------------------------------
+    def _open_out(self) -> None:
+        import subprocess
+        import os
+        d = EXPORT_DIR
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(d))  # noqa: S606
+            else:
+                subprocess.Popen(["xdg-open", str(d)])
+        except Exception as e:  # noqa: BLE001
+            self.append(f"打开目录失败：{e}")
+
+    def _export(self, kind: str) -> None:
+        if not self._recs:
+            self.append("还没有结果可导出 —— 先点「开始」跑一轮")
+            return
+        import batch_check
+        EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        s = self._summary
+        recs = self._recs
+        if self.chk_fail_only.isChecked():
+            recs = [r for r in recs if r["verdict"] != "PASS"]
+
+        try:
+            if kind == "html":
+                p = batch_check.export_html(
+                    recs, str(EXPORT_DIR / f"batch_{ts}.html"), s)
+            elif kind == "csv":
+                p = batch_check.export_csv(recs, str(EXPORT_DIR / f"batch_{ts}.csv"))
+            else:
+                p = batch_check.export_xlsx(
+                    recs, str(EXPORT_DIR / f"batch_{ts}.xlsx"), s)
+                if not p:
+                    self.append("导出 Excel 失败：这个 Python 环境没装 openpyxl。"
+                                "去「安装依赖」页装一下，或改用 CSV。")
+                    return
+        except Exception as e:  # noqa: BLE001
+            self.append(f"导出失败：{type(e).__name__}: {e}")
+            return
+        self.append(f"报告已导出 -> <b>{p}</b>")
+        QMessageBox.information(self, "导出完成",
+                                f"已导出 {len(recs)} 台明细：\n\n{p}\n\n"
+                                f"目录：{EXPORT_DIR}")
+
+
 class FindPanel(Panel):
-    title = "② 设备发现"
+    title = "③ 设备发现"
     desc = "不知道设备 IP 时用这个。扫描本机所在网段，只有能拉通 API 的才算设备。"
 
     def build_controls(self) -> None:
@@ -488,7 +924,7 @@ class FindPanel(Panel):
 
 
 class WatchPanel(Panel):
-    title = "③ IMU 队列监控"
+    title = "④ IMU 队列监控"
     desc = "实时盯录制队列水位与各数据流频率。掉线前水位会先冲高，这里是抓现行的地方。"
 
     def build_controls(self) -> None:
@@ -519,7 +955,7 @@ class WatchPanel(Panel):
 
 
 class SerialPanel(Panel):
-    title = "④ 串口探测"
+    title = "⑤ 串口探测"
     desc = ("直接读头环 IMU 串口，统计真实字节率与帧率。用来判断设备实际输出频率是不是"
             "远超配置值（这是采集掉线的根源之一）。")
 
@@ -546,7 +982,7 @@ class SerialPanel(Panel):
 
 
 class BatteryPanel(Panel):
-    title = "⑤ 电池采样"
+    title = "⑥ 电池采样"
     desc = ("连续采样电池电压/电流/电量，结束时判定充不满的根因"
             "（电量计未校准 / 充不进去 / 净放电）。")
 
@@ -583,7 +1019,7 @@ class BatteryPanel(Panel):
 
 
 class SrcPanel(Panel):
-    title = "⑥ 源码查看"
+    title = "⑦ 源码查看"
     desc = ("不装 docker、不要 sudo，直接读设备上正在跑的容器源码。"
             "升级前后对比关键代码，可当验收依据。")
 
@@ -637,7 +1073,7 @@ class SrcPanel(Panel):
 
 
 class LogPanel(Panel):
-    title = "⑦ 运行日志"
+    title = "⑧ 运行日志"
     desc = "探测设备上日志都放在哪（systemd / 应用目录 / 容器 stdout），并列出最近内容。"
 
     def build_controls(self) -> None:
@@ -654,7 +1090,7 @@ class LogPanel(Panel):
 
 
 class ExportPanel(QWidget):
-    title = "⑧ 报告与文件"
+    title = "⑨ 报告与文件"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -761,8 +1197,9 @@ class MainWindow(QMainWindow):
         body.addWidget(self.stack, 1)
         outer.addLayout(body, 1)
 
-        self.panels = [CheckupPanel(), FindPanel(), WatchPanel(), SerialPanel(),
-                       BatteryPanel(), SrcPanel(), LogPanel(), ExportPanel()]
+        self.panels = [CheckupPanel(), BatchPanel(), FindPanel(), WatchPanel(),
+                       SerialPanel(), BatteryPanel(), SrcPanel(), LogPanel(),
+                       ExportPanel()]
         for p in self.panels:
             title = getattr(p, "title", "")
             it = QListWidgetItem(title)

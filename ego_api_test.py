@@ -13,8 +13,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import html
 import http.client
+import io
 import json
 import os
 import sys
@@ -92,6 +94,7 @@ class Api:
 class R:
     def __init__(self):
         self.items: list[dict] = []
+        self.meta: dict = {}   # 版本/状态/profile/相机数等，批量汇总时直接取用
 
     def add(self, cid, name, status, detail, src=""):
         self.items.append({"id": cid, "name": name, "status": status,
@@ -100,13 +103,33 @@ class R:
         print(f"  [{flag}] {cid} {name:<12} {status:<4} {detail}")
 
 
+def summarize(r) -> dict:
+    """把检查项压成一份计数 + 判定，批量表格和退出码都用它。"""
+    from collections import Counter
+    c = Counter(i["status"] for i in r.items)
+    s = {k: int(c.get(k, 0)) for k in ("PASS", "FAIL", "WARN", "SKIP")}
+    s["total"] = len(r.items)
+    s["verdict"] = "FAIL" if s["FAIL"] else ("WARN" if s["WARN"] else "PASS")
+    return s
+
+
 def auto_checks(api: Api, r: R, model: str, do_collect: bool,
                 device_id: str = "", account: str = "", password: str = "") -> None:
     print("\n--- 自动检查 ---")
 
+    # 版本号来自 openapi.json 的 info.version。批量巡检的汇总表要显示它，
+    # 所以这里顺手收进 meta（不新增检查项，避免影响单台报告的项数）。
+    st_v, spec = api.get("/openapi.json")
+    if st_v == 200 and isinstance(spec, dict):
+        r.meta["version"] = str((spec.get("info") or {}).get("version", ""))
+        r.meta["app"] = str((spec.get("info") or {}).get("title", ""))
+
     # 目标设备在线门禁：设备没接时，后面一堆检查会连锁失败，先说清楚
     st0, h0 = api.get("/api/v2/health")
-    devmap = ((h0 or {}).get("selection") or {}).get("devices") or {} if isinstance(h0, dict) else {}
+    # 连不上时 api.get 返回的是错误字符串而不是 dict，这里必须先判类型，
+    # 否则批量巡检扫到离线设备会直接 AttributeError 崩掉（而不是记成 FAIL）
+    h0 = h0 if isinstance(h0, dict) else {}
+    devmap = ((h0 or {}).get("selection") or {}).get("devices") or {}
     active_dev = ((h0 or {}).get("selection") or {}).get("active_selection") or {}
     active_dev = active_dev.get("camera_device", "") if isinstance(active_dev, dict) else ""
     if device_id:
@@ -130,14 +153,20 @@ def auto_checks(api: Api, r: R, model: str, do_collect: bool,
         state = d.get("overall_state", "?")
         prof = d.get("profile", "?")
         devs = (d.get("selection") or {}).get("enabled_devices") or []
+        # 顺手收进 meta：批量巡检的汇总表直接取这几项，不必再请求一遍设备
+        r.meta["state"] = str(state)
+        r.meta["profile"] = str(prof)
+        r.meta["devices"] = ",".join(str(x) for x in devs)
         r.add("E-D-004", "采集控制台", "PASS" if state == "healthy" else "WARN",
               f"state={state} profile={prof} devices={devs}", "/api/v2/health")
     else:
+        r.meta["state"] = f"HTTP {st}"
         r.add("E-D-004", "采集控制台", "FAIL", f"HTTP {st}: {str(d)[:120]}", "/api/v2/health")
 
     # E-D-003 / E-L-015 头环与相机检测
     st2, cam = api.get("/api/v2/dex/camera-devices")
     n_cam = len(cam) if st2 == 200 and isinstance(cam, list) else -1
+    r.meta["cameras"] = n_cam
     r.add("E-L-015", "相机检测", "PASS" if n_cam > 0 else "FAIL",
           f"检出相机 {n_cam} 台" if n_cam >= 0 else f"HTTP {st2}", "/api/v2/dex/camera-devices")
 
@@ -539,26 +568,62 @@ def main() -> None:
     ap.add_argument("--no-manual", action="store_true", help="跳过人工确认项")
     ap.add_argument("--upload", action="store_true", help="回填飞书表格")
     ap.add_argument("--dry-run", action="store_true")
+    # --- 下面三个是给 batch_check.py 批量调度用的，人工单台跑不需要 ---
+    ap.add_argument("--json-only", action="store_true",
+                    help="只把结果 JSON 打到 stdout，不写 HTML/JSON 报告文件（批量用）")
+    ap.add_argument("--quiet", action="store_true",
+                    help="吞掉逐项日志并收进 JSON 的 log 字段（批量用）")
+    ap.add_argument("--exit-code", action="store_true",
+                    help="有 FAIL 项时以退出码 1 结束（批量用）")
     args = ap.parse_args()
     import devip
     args.host = devip.resolve_host(args.host)
 
+    if args.quiet:
+        # redirect_stdout 是进程级的，所以只能整体包住检查流程。
+        # 批量并发跑时不能靠这个，必须靠子进程隔离（见 batch_check.py）。
+        cap = io.StringIO()
+        with contextlib.redirect_stdout(cap):
+            payload = _run_checks(args)
+        payload["log"] = cap.getvalue()
+    else:
+        payload = _run_checks(args)
+
+    if args.json_only:
+        # 保证 stdout 干净：批量端直接 json.loads 这段
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        r = _LAST_R[0]
+        os.makedirs(OUT, exist_ok=True)
+        jp = os.path.join(OUT, f"apicheck_{args.device}.json")
+        with open(jp, "w", encoding="utf-8") as f:
+            json.dump({"host": args.host, "device": args.device,
+                       "at": payload["at"], "items": r.items},
+                      f, ensure_ascii=False, indent=2)
+        p = write_report(r, args.host, args.device)
+        print(f"\nJSON -> {jp}")
+        print(f"报告 -> {p}")
+        if args.upload or args.dry_run:
+            upload(r, args.dry_run)
+
+    if args.exit_code and payload["summary"]["FAIL"]:
+        sys.exit(1)
+
+
+_LAST_R: list = [None]
+
+
+def _run_checks(args) -> dict:
+    """跑一遍全部检查并返回可 JSON 序列化的结果。拆出来是为了让 main 便于包 redirect_stdout。"""
     api = Api(args.host, args.port)
     print(f"目标 {args.host}:{args.port}  只读体检{'' if args.do_collect else '（不启停采集）'}")
     r = R()
     auto_checks(api, r, args.model, args.do_collect, args.device_id, args.account, args.password)
     manual_checks(r, args.no_manual)
-
-    os.makedirs(OUT, exist_ok=True)
-    jp = os.path.join(OUT, f"apicheck_{args.device}.json")
-    with open(jp, "w", encoding="utf-8") as f:
-        json.dump({"host": args.host, "device": args.device, "at": datetime.now().isoformat(),
-                   "items": r.items}, f, ensure_ascii=False, indent=2)
-    p = write_report(r, args.host, args.device)
-    print(f"\nJSON -> {jp}")
-    print(f"报告 -> {p}")
-    if args.upload or args.dry_run:
-        upload(r, args.dry_run)
+    _LAST_R[0] = r
+    return {"host": args.host, "port": args.port, "device": args.device,
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "summary": summarize(r), "meta": r.meta, "items": r.items}
 
 
 if __name__ == "__main__":

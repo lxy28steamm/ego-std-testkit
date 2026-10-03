@@ -27,6 +27,7 @@ echo   2  体检 + 实测采集启停
 echo   3  18条用例交互引导
 echo   4  生成 HTML 报告
 echo   5  导出 Excel
+echo   6  批量巡检 (多台设备, 并发)
 echo   8  自动扫描设备IP并记住
 echo   9  修改设备IP (当前 %HOST%)
 echo   0  退出
@@ -39,6 +40,7 @@ if "%CH%"=="2" goto c2
 if "%CH%"=="3" goto c3
 if "%CH%"=="4" goto c4
 if "%CH%"=="5" goto c5
+if "%CH%"=="6" goto c6
 if "%CH%"=="8" goto c8
 if "%CH%"=="9" goto c9
 if "%CH%"=="0" goto end
@@ -86,6 +88,22 @@ goto pause
 set "DEV="
 set /p "DEV=设备编号(需先跑过 3): "
 "%PY%" ego_test.py export -d %DEV%
+chcp 936 >nul
+goto pause
+
+:c6
+chcp 65001 >nul
+set "BIPS="
+set /p "BIPS=设备IP(留空=自动扫描本机网段, 多台用逗号分隔): "
+set "BW=5"
+set /p "BW=并发数(默认5, 3-10为宜): "
+if "%BW%"=="" set "BW=5"
+echo 正在批量巡检，请稍候...
+if "%BIPS%"=="" (
+  "%PY%" batch_check.py --discover --workers %BW%
+) else (
+  "%PY%" batch_check.py --ip "%BIPS%" --workers %BW%
+)
 chcp 936 >nul
 goto pause
 
