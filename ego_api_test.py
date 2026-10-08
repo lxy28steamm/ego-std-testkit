@@ -231,6 +231,53 @@ def summarize(r) -> dict:
     return s
 
 
+def print_grouped_summary(r, s: dict, show_pass: bool = False) -> None:
+    """巡检结尾在控制台重列一遍「分组清单」：失败 → 告警 → 通过。
+
+    现场反馈：跑完一屏 30 多行流水，真正有问题的只有 3~8 行，夹在中间
+    得一行行翻。这里把需要关注的挑出来重列（失败在前、告警在后），
+    通过项默认只给计数（`--show-pass` 才展开）—— 控制台不变长，问题一眼可见。
+
+    实时流水（R.add 逐条打印）保持原样不动：GUI 和 batch_check 都按行解析它。
+    """
+    bar = "─" * 88
+    n_bad, n_warn, n_pass = s["FAIL"], s["WARN"], s["PASS"]
+    print()
+    print(bar)
+    head = f"需要关注 {n_bad + n_warn} 项"
+    if n_bad:
+        head += f"    {ST_ICON['FAIL']} 失败 {n_bad}"
+    if n_warn:
+        head += f"    {ST_ICON['WARN']} 告警 {n_warn}"
+    print(head)
+    print(bar)
+    if n_bad or n_warn:
+        for st in ("FAIL", "WARN"):
+            for i in r.items:
+                if i["status"] != st:
+                    continue
+                print(f" {ST_ICON[st]} {i.get('seq', '?'):>3}. "
+                      f"{i['name']:<16} {st:<4} {i['detail']}")
+    else:
+        print("  没有需要关注的项目。")
+    print(bar)
+    if show_pass:
+        print(f"{ST_ICON['PASS']} 通过 {n_pass} 项")
+        for i in r.items:
+            if i["status"] == "PASS":
+                print(f" {ST_ICON['PASS']} {i.get('seq', '?'):>3}. "
+                      f"{i['name']:<16} PASS {i['detail']}")
+    else:
+        print(f"{ST_ICON['PASS']} 通过 {n_pass} 项"
+              f"（默认折叠，加 --show-pass 展开）")
+    if s.get("skipped"):
+        print(f"{ST_ICON['SKIP']} 跳过 {s['skipped']} 项"
+              f"（加 --show-skip 展开）")
+    print(bar)
+    v = s["verdict"]
+    print(f"结论：{ST_LABEL_FULL[v]}")
+
+
 def auto_checks(api: Api, r: R, model: str, do_collect: bool,
                 device_id: str = "", account: str = "", password: str = "",
                 require_ssd: bool = False) -> None:
@@ -1083,6 +1130,8 @@ def main() -> None:
     ap.add_argument("--no-manual", action="store_true", help="跳过人工确认项")
     ap.add_argument("--show-skip", action="store_true",
                     help="报告里列出被跳过的项（默认只列实检项）")
+    ap.add_argument("--show-pass", action="store_true",
+                    help="控制台结尾的分组清单里展开通过项（默认只给计数）")
     ap.add_argument("--require-ssd", action="store_true",
                     help="强制要求外挂 SSD（出厂验收场景）。"
                          "默认没插外挂盘也判PASS，仅说明当前测试范围")
@@ -1114,6 +1163,8 @@ def main() -> None:
         print(json.dumps(payload, ensure_ascii=False))
     else:
         r = _LAST_R[0]
+        # 跑完先给一份分组清单（失败→告警→通过），省得在一屏流水里翻问题项
+        print_grouped_summary(r, payload["summary"], show_pass=args.show_pass)
         os.makedirs(OUT, exist_ok=True)
         jp = os.path.join(OUT, f"apicheck_{args.device}.json")
         with open(jp, "w", encoding="utf-8") as f:
