@@ -58,6 +58,13 @@ API_PORT = devip.API_PORT
 SSH_PORT = devip.SSH_PORT
 SSH_USER = "ls"
 SSH_PASS = "ls"  # 设备端固定口令，测试设备通用
+# GUI（用 QProcess 起子进程，没有可交互的终端）通过这个环境变量把云账号密码
+# 传进来。用环境变量而不是 --password：命令行参数会出现在进程列表里，
+# 一样会泄露，env 至少不进 shell 历史。
+ENV_PASSWORD = "EGO_CLOUD_PASSWORD"
+# GUI 起的子进程一律没有可用终端，由 app.py 的 Runner 统一注入这个开关，
+# 让脚本彻底不要去碰交互式输入。
+ENV_NONINTERACTIVE = "EGO_NONINTERACTIVE"
 
 WORK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_frames")
 
@@ -114,6 +121,47 @@ def warn(msg):
 def die(msg, code=1):
     print("\n  [X] " + msg)
     sys.exit(code)
+
+
+def stdin_is_real_tty():
+    """判断 stdin 是不是真的连着终端。
+
+    坑（现场踩过）：Windows 上 NUL 设备（subprocess.DEVNULL、
+    QProcess.nullDevice()）被打开后，sys.stdin.isatty() 会**返回 True**
+    —— 实测 DEVNULL→True / PIPE→False。而 GUI 用 QProcess 起子进程时
+    stdin 正好是 NUL，于是「没有终端」被误判成「有终端」，getpass 一调用
+    就永久阻塞：界面表现就是点开始后卡住不动，且没有任何可操作的提示。
+    所以 Windows 上必须再问一次：这个句柄真的是控制台吗？
+    """
+    if not sys.stdin.isatty():
+        return False
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        import msvcrt
+        handle = msvcrt.get_osfhandle(sys.stdin.fileno())
+        mode = ctypes.c_ulong()
+        # 非控制台句柄（如 NUL、管道）GetConsoleMode 返回 0
+        return bool(ctypes.windll.kernel32.GetConsoleMode(
+            ctypes.c_void_p(handle), ctypes.byref(mode)))
+    except Exception:
+        return False
+
+
+def ask_cloud_password(account):
+    """取云账号密码：--password > 环境变量 > 交互式输入。
+
+    非交互环境（GUI 子进程、被管道接走）且前两者都没有时**直接失败**，
+    绝不停在那里等输入 —— 见 stdin_is_real_tty() 里记的那个坑。
+    """
+    if (os.environ.get(ENV_NONINTERACTIVE) == "1"
+            or not stdin_is_real_tty()):
+        die("需要云账号密码，但当前没有可交互终端。\n"
+            "      GUI 里请用「密码」输入框（内部经环境变量 %s 传入）；\n"
+            "      命令行里请加 --password，或换到有终端的地方运行。"
+            % ENV_PASSWORD)
+    return getpass.getpass("云账号 %s 密码: " % account)
 
 
 def cid(prefix):
@@ -461,7 +509,9 @@ def main():
     if not args.skip_upload:
         if not args.account:
             die("上传需要 --account（云账号手机号）。只采集的话加 --skip-upload。")
-        password = args.password or getpass.getpass("云账号 %s 密码: " % args.account)
+        password = (args.password
+                    or os.environ.get(ENV_PASSWORD)
+                    or ask_cloud_password(args.account))
         step("1. 云账号登录")
         account_id = do_login(base, args.account, password)
         step("2. 匹配采集任务")

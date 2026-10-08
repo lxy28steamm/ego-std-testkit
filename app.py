@@ -122,17 +122,20 @@ class Runner(QObject):
         super().__init__(parent)
         self.proc = QProcess(self)
         self.proc.setProcessChannelMode(QProcess.MergedChannels)
-        env = QProcessEnvironment.systemEnvironment()
-        env.insert("PYTHONIOENCODING", "utf-8")
-        env.insert("PYTHONUTF8", "1")
-        self.proc.setProcessEnvironment(env)
         self.proc.setWorkingDirectory(str(BASE))
+        # 子进程的 stdin 接到空设备：万一有脚本想交互式读输入（input/getpass），
+        # 会立刻读到 EOF 报错，而不是永久阻塞等一个永远不会来的输入。
+        # 这个 bug 现场出现过 —— 采传缺密码时界面「卡住不动」，没有任何提示。
+        try:
+            self.proc.setStandardInputFile(QProcess.nullDevice())
+        except Exception:
+            pass   # 老版本 Qt 没有 nullDevice()，不影响主流程
         self.proc.readyReadStandardOutput.connect(self._read)
         self.proc.finished.connect(self._done)
         self.proc.errorOccurred.connect(self._error)
         self._buf = b""
 
-    def start(self, args: list[str]) -> bool:
+    def start(self, args: list[str], extra_env: dict | None = None) -> bool:
         if self.running:
             return False
         script = BASE / args[0]
@@ -141,6 +144,17 @@ class Runner(QObject):
             self.finished.emit(-1)
             return False
         self._buf = b""
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONIOENCODING", "utf-8")
+        env.insert("PYTHONUTF8", "1")
+        # GUI 起的子进程统一打上「没有终端」标记：脚本里任何交互式读取都要
+        # 立刻失败，不能停在那等输入 —— 否则界面表现是「卡住不动」。
+        # 注意不能只靠 sys.stdin.isatty() 判断：Windows 的 NUL 设备（QProcess
+        # 的 nullDevice）会让它返回 True，见 collect_and_upload.stdin_is_real_tty。
+        env.insert("EGO_NONINTERACTIVE", "1")
+        for k, v in (extra_env or {}).items():
+            env.insert(k, v)
+        self.proc.setProcessEnvironment(env)
         self.line.emit(f"$ {PYEXE} {' '.join(args)}")
         self.line.emit("-" * 68)
         self.proc.setProgram(PYEXE)
@@ -282,6 +296,10 @@ class Panel(QWidget):
     def build_args(self) -> list[str]:
         return []
 
+    def build_env(self) -> dict:
+        """给子进程注入的额外环境变量（如云账号密码）。默认无。"""
+        return {}
+
     def _on_shutdown_toggle(self, _state) -> None:
         # 直接读控件状态，避免 Qt5/Qt6 里 stateChanged 参数类型差异
         if self.chk_shutdown.isChecked():
@@ -327,7 +345,7 @@ class Panel(QWidget):
         self.btn_run.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.out.clear()
-        if not self.runner.start(args):
+        if not self.runner.start(args, self.build_env()):
             self.on_finished(-1)
 
     # --- 输出辅助 ---------------------------------------------------
@@ -1100,7 +1118,18 @@ class CollectPanel(Panel):
         )
         g.addWidget(self.chk_keep, 2, 0, 1, 2)
 
-        g.addWidget(QLabel("密码在启动后于命令行输入（不写进代码、不留 shell 历史）"), 2, 2, 1, 2)
+        # 原来这里写的是「密码在启动后于命令行输入」—— 但 GUI 用 QProcess 起
+        # 子进程，根本没有可供输入的终端，脚本里的 getpass 会永久阻塞，
+        # 现场表现就是「点开始后卡住不动」。改成 GUI 里直接填，
+        # 经环境变量注入子进程（不进命令行、不进 shell 历史）。
+        g.addWidget(QLabel("云账号密码"), 2, 2)
+        self.pwd = QLineEdit()
+        self.pwd.setEchoMode(QLineEdit.Password)
+        self.pwd.setPlaceholderText("采集 + 上传必填；只采集可留空")
+        self.pwd.setToolTip(
+            "只在内存里经环境变量传给子进程，不写进命令行、不留 shell 历史。\n"
+            "选「完整：采集 + 上传」时必须填，否则点开始会被拦下。")
+        g.addWidget(self.pwd, 2, 3)
 
         # 现场反馈：选了「完整：采集 + 上传」但没填云账号，命令却变成 --skip-upload，
         # 界面上没有任何交代（静默降级）。这里把「本次实际会怎么跑」显式写出来，
@@ -1110,6 +1139,7 @@ class CollectPanel(Panel):
         self.mode_hint.setTextInteractionFlags(Qt.TextSelectableByMouse)
         g.addWidget(self.mode_hint, 3, 0, 1, 4)
         self.acct.textChanged.connect(self._sync_mode_hint)
+        self.pwd.textChanged.connect(self._sync_mode_hint)
         self.mode.currentIndexChanged.connect(self._sync_mode_hint)
         self._sync_mode_hint()
 
@@ -1135,10 +1165,31 @@ class CollectPanel(Panel):
         if not acct:
             return "collect", ("选了「采集 + 上传」但云账号为空 —— "
                                "会自动降级成「只采集，不上传」")
+        if not self.pwd.text():
+            return "full", (f"采集并上传到云账号 {acct} —— "
+                            "但密码为空，点开始会被拦下")
         return "full", f"采集并上传到云账号 {acct}"
+
+    def _missing_pwd(self) -> bool:
+        """选了上传、账号也填了，但密码还空着 —— 开跑前要拦下。"""
+        return self._effective()[0] == "full" and not self.pwd.text()
+
+    def build_env(self) -> dict:
+        """把密码经环境变量交给子进程。
+
+        脚本侧读 EGO_CLOUD_PASSWORD（见 collect_and_upload.ENV_PASSWORD）。
+        不走 --password 是因为命令行参数会出现在进程列表里。
+        """
+        pwd = self.pwd.text()
+        return {"EGO_CLOUD_PASSWORD": pwd} if pwd else {}
 
     def _sync_mode_hint(self) -> None:
         eff, why = self._effective()
+        if self._missing_pwd():
+            # 方向是上传、只差密码 —— 用告警色，别让人以为已经齐活了
+            self.mode_hint.setStyleSheet(f"color:{C_WARN};font-size:12px")
+            self.mode_hint.setText(f"! 本次实际执行：{why}")
+            return
         color = {"full": C_OK, "collect": C_WARN, "dry": "#5b6472"}[eff]
         icon = {"full": "✔ ", "collect": "! ", "dry": "- "}[eff]
         self.mode_hint.setStyleSheet(f"color:{color};font-size:12px")
@@ -1172,6 +1223,16 @@ class CollectPanel(Panel):
         if "--dry-run" in args:
             super().on_run()
             return
+        # 缺密码时在 GUI 里就说清楚。以前是让脚本去 getpass —— GUI 子进程没有
+        # 终端，会直接卡死不动，现场就是这么踩的。
+        if self._missing_pwd():
+            QMessageBox.warning(
+                self, "还差一步：云账号密码",
+                "「完整：采集 + 上传」需要云账号密码。\n\n"
+                "请在参数区「云账号密码」框里填好后重新点开始。\n"
+                "（密码只在内存里经环境变量传给子进程，不进命令行、不留 shell 历史）",
+            )
+            return
         eff, _ = self._effective()
         need_acct = eff == "full"
         acct = self.acct.text().strip()
@@ -1198,7 +1259,7 @@ class CollectPanel(Panel):
         self.btn_run.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.out.clear()
-        if not self.runner.start(args):
+        if not self.runner.start(args, self.build_env()):
             self.on_finished(-1)
 
     @staticmethod

@@ -249,8 +249,8 @@ python container_src.py cat backend/DevicesManager/ego_std/hardware/yctc_imu.py 
 
 ```bash
 # 完整链路（省略 --host 会自动扫网段找设备）
-python collect_and_upload.py --seconds 5 --account <云账号手机号>
-# 密码建议不传，交互式输入，免得留在 shell 历史里
+python collect_and_upload.py --seconds 5 --account <云账号手机号> --password <密码>
+# 也可以不传 --password，在有终端的地方跑会提示输入，不留 shell 历史
 
 # 只读跑一遍：看设备状态、任务、待传目录，不采集不上传
 python collect_and_upload.py --account <账号> --dry-run
@@ -267,6 +267,24 @@ python collect_and_upload.py --seconds 5 --skip-upload
 > `--skip-upload`」——这是**降级不是 bug**，所以 GUI 参数区专门有一行
 > 「本次实际执行」实时显示真实走向，开跑前的确认弹窗也会再警告一次。
 > 一句话：**想上传就必须填云账号**。
+
+### 密码怎么给（GUI 与命令行的区别）
+
+密码来源优先级：`--password` > 环境变量 `EGO_CLOUD_PASSWORD` > 交互式输入。
+
+| 场景 | 怎么传 | 说明 |
+|---|---|---|
+| **GUI** | 参数区「云账号密码」框 | 只在内存里经环境变量传给子进程，不进命令行、不留 shell 历史。选「采集 + 上传」不填会被当场拦下 |
+| 命令行（有终端） | 省略 `--password` | 会提示 `云账号 xxx 密码:`，输入不回显、不留 shell 历史 |
+| 命令行（无终端） | 加 `--password` 或设环境变量 | 否则直接报错退出 |
+
+> **为什么 GUI 不能用交互式输入**：GUI 用 `QProcess` 起子进程，stdin 接的是
+> Windows 的 `NUL` 设备 —— 而 `NUL` 会让 `sys.stdin.isatty()` **返回 True**
+> （实测 `DEVNULL→True`、`PIPE→False`），脚本会误以为"有终端"然后调
+> `getpass`，**永久阻塞**，界面上表现就是「点开始后卡住不动」。
+> 现在双保险：GUI 一律给子进程注入 `EGO_NONINTERACTIVE=1`；
+> 脚本侧用 `GetConsoleMode` 复查句柄是不是真控制台（`stdin_is_real_tty()`）。
+> 拿不到密码时**立即报错退出**，绝不停在那等一个永远不会来的输入。
 
 ### 三个必须知道的坑
 
