@@ -218,7 +218,10 @@ def summarize(r) -> dict:
 
 
 def auto_checks(api: Api, r: R, model: str, do_collect: bool,
-                device_id: str = "", account: str = "", password: str = "") -> None:
+                device_id: str = "", account: str = "", password: str = "",
+                require_ssd: bool = False) -> None:
+    """require_ssd=True 时强制校验外挂 SSD（出厂验收场景）；
+    默认 False —— 没插外挂盘判PASS 并说明当前测试范围。"""
     print("\n--- 自动检查 ---")
 
     # 版本号来自 openapi.json 的 info.version。批量巡检的汇总表要显示它，
@@ -400,26 +403,52 @@ def auto_checks(api: Api, r: R, model: str, do_collect: bool,
     #
     # 原来这里同时加了 E-D-006 和 E-L-013 两条，**同接口同判据，纯重复**，
     # 只是名字里带个 "(Livstudio)"。已合并成一条。
+    #
+    # 2026-10-08 调整：没插外挂 SSD 时不再判 FAIL。
+    # 原逻辑只看 kind != "local" 的盘，没插就 FAIL —— 对"出厂必检SSD"的场景是对的，
+    # 但研发自测/本机调试时设备往往不挂外置盘，会把整台设备标成不合格，
+    # 掩盖真正的故障。现在改为：只有系统里存在外挂盘时才检查其可用性；
+    # 没有外挂盘则判 PASS 并明确说明"未接外挂盘"，让报告反映真实测试范围。
+    # 需要强制要求 SSD 的场景（出厂验收）用 --require-ssd 打开。
     st4, s = api.get("/api/v2/storage")
     if st4 == 200 and isinstance(s, dict):
         kind = s.get("current_kind", "?")
-        opts = s.get("options") or []
+        # 当前存储（无论内外部）都要报容量 —— 交付场景关心"还剩多少"。
+        # ⚠️ opts 里可能混入非 dict 元素（实测踩过：'str' object has no attribute
+        #    'get'），取容量前必须过滤，否则遍历时崩。
+        opts = [o for o in (s.get("options") or []) if isinstance(o, dict)]
         ext = [o for o in opts if o.get("kind") not in ("local",)]
         avail = [o for o in ext if o.get("available")]
-        # 顺带把容量信息打出来 —— 交付场景很关心"还剩多少"，原来只报有没有
+        cur_opt = next((o for o in opts
+                        if s.get("current") in (o.get("storage_id"), o.get("path"))), None)
         cap = ""
-        for o in (avail or ext):
+        for o in ([cur_opt] if cur_opt else (avail or ext)):
             tot, free = o.get("total_bytes"), o.get("free_bytes")
             if tot:
                 cap = " 容量 %.1f/%.1f GB" % ((free or 0) / 2**30, tot / 2**30)
                 break
+
         if avail:
+            # 有外挂盘且可用 —— 正常通过
             r.add("E-D-006", "SSD存储", "PASS",
-                  f"当前={kind} 可用={[o.get('kind') for o in avail]}{cap}", "/api/v2/storage")
-        else:
-            r.add("E-D-006", "SSD存储", "FAIL",
-                  f"当前={kind} 候选={[(o.get('kind'), o.get('available')) for o in opts]}",
+                  f"当前={kind} 外挂可用={[o.get('kind') for o in avail]}{cap}",
                   "/api/v2/storage")
+        elif require_ssd:
+            # 强制要求 SSD 且没插 —— 验收场景该拦
+            r.add("E-D-006", "SSD存储", "FAIL",
+                  f"要求外挂SSD但未接（当前={kind} "
+                  f"候选={[(o.get('kind'), o.get('available')) for o in opts]}）",
+                  "/api/v2/storage")
+        elif ext:
+            # 挂了外挂盘但不可用 —— 真正的故障，该报
+            r.add("E-D-006", "SSD存储", "FAIL",
+                  f"外挂盘已接但不可用：{[(o.get('kind'), o.get('available')) for o in ext]}{cap}",
+                  "/api/v2/storage")
+        else:
+            # 场景：本机无外挂盘（研发自测/本机调试）。这是真实测试范围，不是故障。
+            r.add("E-D-006", "SSD存储", "PASS",
+                  f"未接外挂盘，当前={kind}（本机存储）{cap}"
+                  f"；--require-ssd 可强制校验", "/api/v2/storage")
     else:
         r.add("E-D-006", "SSD存储", "FAIL", f"HTTP {st4}", "/api/v2/storage")
 
@@ -963,6 +992,9 @@ def main() -> None:
     ap.add_argument("--no-manual", action="store_true", help="跳过人工确认项")
     ap.add_argument("--show-skip", action="store_true",
                     help="报告里列出被跳过的项（默认只列实检项）")
+    ap.add_argument("--require-ssd", action="store_true",
+                    help="强制要求外挂 SSD（出厂验收场景）。"
+                         "默认没插外挂盘也判PASS，仅说明当前测试范围")
     ap.add_argument("--upload", action="store_true", help="回填飞书表格")
     ap.add_argument("--dry-run", action="store_true")
     # --- 下面三个是给 batch_check.py 批量调度用的，人工单台跑不需要 ---
@@ -1020,7 +1052,8 @@ def _run_checks(args) -> dict:
     print(f"目标 {args.host}:{args.port}  只读体检{'' if args.do_collect else '（不启停采集）'}")
     # 默认隐藏 SKIP 项（报告只列实检项）；--show-skip 可把跳过项也列出来
     r = R(hide_skip=not args.show_skip)
-    auto_checks(api, r, args.model, args.do_collect, args.device_id, args.account, args.password)
+    auto_checks(api, r, args.model, args.do_collect, args.device_id, args.account,
+                   args.password, require_ssd=args.require_ssd)
     manual_checks(r, args.no_manual)
     _LAST_R[0] = r
     return {"host": args.host, "port": args.port, "device": args.device,

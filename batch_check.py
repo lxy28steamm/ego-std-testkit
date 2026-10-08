@@ -202,17 +202,22 @@ def re_split_commas(s: str) -> list[str]:
 
 
 def run_one(ip: str, port: int = 18000, timeout: int = 180, do_collect: bool = False,
-            model: str = "", device_id: str = "", python_exe: str = "") -> dict:
+            model: str = "", device_id: str = "", python_exe: str = "",
+            require_ssd: bool = False) -> dict:
     """在一台设备上跑完整体检，返回一条扁平记录。永不抛异常。
 
     device_id 传空串 = 跳过 DEV-ONLINE 门禁。批量场景必须这样：不同批次设备的
     逻辑 id 并不一样（现场见到 ego-std-235，现场也有 ego-lite-01），
     写死一个会让每台都因「设备清单中无此项」判 FAIL。
+
+    require_ssd 透传给引擎：出厂验收要求外挂 SSD 才打开；研发自测不强制。
     """
     exe = python_exe or sys.executable
     cmd = [exe, ENGINE, "--host", ip, "--port", str(port),
            "--json-only", "--quiet", "--no-manual", "--exit-code",
            "--device-id", device_id]      # 空串也要显式传，否则 ego_api_test 会用自己的默认值
+    if require_ssd:
+        cmd.append("--require-ssd")
     if do_collect:
         cmd.append("--do-collect")
     if model:
@@ -274,7 +279,7 @@ def run_one(ip: str, port: int = 18000, timeout: int = 180, do_collect: bool = F
 def run_batch(ips: list[str], workers: int = 5, timeout: int = 180,
               do_collect: bool = False, model: str = "",
               device_id: str = "", port: int = 18000,
-              on_progress=None) -> list[dict]:
+              on_progress=None, require_ssd: bool = False) -> list[dict]:
     """并发跑一批设备。on_progress(done, total, rec) 用于 GUI 实时刷新。"""
     if not ips:
         return []
@@ -283,8 +288,10 @@ def run_batch(ips: list[str], workers: int = 5, timeout: int = 180,
     # workers 至少 1，最多不超过设备数 —— 17 台机器并发 17 也没意义，还容易把网络打满
     n = max(1, min(int(workers), total))
     with ThreadPoolExecutor(max_workers=n) as pool:
+        # 用关键字传 require_ssd —— run_one 的第 6 个位置参数是 python_exe，
+        # 位置传递会把 bool 塞给解释器路径，导致 TypeError。
         futs = {pool.submit(run_one, ip, port, timeout, do_collect, model,
-                            device_id): ip for ip in ips}
+                            device_id, require_ssd=require_ssd): ip for ip in ips}
         done = 0
         for fut in as_completed(futs):
             ip = futs[fut]
@@ -543,6 +550,9 @@ def main() -> None:
                     help="目标逻辑设备 id 做门禁检查；留空跳过（批量推荐，"
                          "因为不同批次设备 id 不同：ego-std-235 / ego-lite-01 …）")
     ap.add_argument("--do-collect", action="store_true", help="实测采集启停（会写文件）")
+    ap.add_argument("--require-ssd", action="store_true",
+                    help="强制要求外挂 SSD（出厂验收）。"
+                         "默认没插也判PASS，仅说明当前测试范围")
     ap.add_argument("--html", default="", help="HTML 报告输出路径")
     ap.add_argument("--xlsx", default="", help="Excel 报告输出路径（需 openpyxl）")
     ap.add_argument("--csv", default="", help="CSV 输出路径")
@@ -574,7 +584,8 @@ def main() -> None:
               + (f"  {rec['error'][:60]}" if rec.get("error") else ""))
 
     recs = run_batch(ips, args.workers, args.timeout, args.do_collect, args.model,
-                     args.device_id, args.port, on_progress=prog)
+                     args.device_id, args.port, on_progress=prog,
+                     require_ssd=args.require_ssd)
     s = summarize_batch(recs)
     _print_table(recs, s)
     print(f"总耗时 {time.time() - t0:.1f}s")
