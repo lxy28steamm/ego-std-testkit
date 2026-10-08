@@ -252,13 +252,18 @@ def run_one(ip: str, port: int = 18000, timeout: int = 180, do_collect: bool = F
     rec.update({
         "verdict": s.get("verdict", "FAIL"),
         "PASS": s.get("PASS", 0), "FAIL": s.get("FAIL", 0),
-        "WARN": s.get("WARN", 0), "SKIP": s.get("SKIP", 0),
+        "WARN": s.get("WARN", 0),
+        # 跳过项默认不进 items（引擎侧 hide_skip），skipped 单独计数，
+        # 汇总表末尾显示「跳过 N」保证数量透明，不逐项刷屏。
+        "SKIP": s.get("skipped", 0),
         "total": s.get("total", 0),
+        "total_all": s.get("total_all", 0),
         "state": m.get("state", ""), "profile": m.get("profile", ""),
         "cameras": m.get("cameras", ""), "version": m.get("version", ""),
         "sn": m.get("sn", ""), "serial": m.get("serial", ""),
         "ldp_id": m.get("ldp_id", ""), "camera_sn": m.get("camera_sn", ""),
         "model": m.get("model", ""), "slot": m.get("slot", ""),
+        "dq_extra": m.get("dq_extra", 0),
         "items": d.get("items", []), "log": d.get("log", ""),
     })
     if p.returncode not in (0, 1):

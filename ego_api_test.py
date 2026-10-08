@@ -124,25 +124,95 @@ class Api:
 
 # ------------------------------------------------------------------ 检查项
 
+# 分组定义：给三套来源混杂的 ID 一个统一的展示分类。
+# 背景：历史上存在三套并行编号 —— ①飞书用例号 E-D-xxx / E-E-xxx / E-L-xxx
+#      ②功能名 CAM-SEL / IMU-CFG / QUEUE-HIST   ③DQ-xxx（数据质量增强）
+# 三套混排导致报告难读，这里按「测什么」重新归组，原始 ID 保留在 ref 里可追溯。
+GROUPS = [
+    ("device",  "设备与硬件"),
+    ("network", "网络与连接"),
+    ("storage", "存储"),
+    ("power",   "供电与资源"),
+    ("stream",  "数据流质量"),
+    ("product", "产品与云端"),
+]
+
+# ID → 分组。取不到就归 product。
+GROUP_OF = {
+    "E-D-003": "device", "E-D-004": "device", "E-D-006": "storage",
+    "E-D-007": "network", "E-D-002": "network", "E-D-005": "stream",
+    "CAM-SEL": "device",
+    "E-E-009": "device", "E-L-017": "device", "E-L-011": "product",
+    "IMU-CFG": "device", "IMU-SENSOR": "device",
+    "QUEUE-HIST": "stream",
+    "E-D-001": "power", "E-E-008": "device",     # 画面检查本质是相机能力
+    "E-L-012": "product", "E-L-014": "product", "E-L-016": "product",
+}
+
+
+def group_of(cid: str) -> str:
+    """归组规则。
+
+    DQ-xxx 按百位取组：1xx 产物 / 2xx 供电 / 3xx 状态 / 4xx 数据流 / 5xx 接口。
+    5xx 里设备类（相机枚举/就绪）归device，其余接口类归 product——
+    所以不能整段映射，要单独列。
+    """
+    if cid.startswith("DQ-"):
+        if cid in ("DQ-500", "DQ-501"):      # 相机枚举/就绪 = 硬件能力
+            return "device"
+        return {"1": "stream", "2": "power", "3": "device",
+                "4": "stream", "5": "product"}.get(cid[3:4], "product")
+    return GROUP_OF.get(cid, "product")
+
 
 class R:
-    def __init__(self):
+    def __init__(self, hide_skip: bool = True):
         self.items: list[dict] = []
         self.meta: dict = {}   # 版本/状态/profile/相机数等，批量汇总时直接取用
+        self.hide_skip = hide_skip   # SKIP 不进 items（进 meta.skipped），报告只列实检项
 
     def add(self, cid, name, status, detail, src=""):
-        self.items.append({"id": cid, "name": name, "status": status,
-                           "detail": detail, "src": src})
+        rec = {"id": cid, "name": name, "status": status,
+               "detail": detail, "src": src,
+               "group": group_of(cid)}
+        if status == "SKIP" and self.hide_skip:
+            # 跳过项只记数量，不进清单 —— 报告里不刷屏
+            self.meta["skipped"] = self.meta.get("skipped", 0) + 1
+            self.meta.setdefault("skipped_ids", []).append(f"{cid} {name}")
+            return
+        self.items.append(rec)
         flag = {"PASS": "+", "FAIL": "x", "WARN": "!", "SKIP": "-"}[status]
-        print(f"  [{flag}] {cid} {name:<12} {status:<4} {detail}")
+        # 展示用统一编号：组内序号（+ 原始 ID 后缀），便于按序核对
+        print(f"  [{flag}] {cid:<13} {name:<12} {status:<4} {detail}")
+
+    def numbered(self) -> list[dict]:
+        """按分组排序并编上全局序号，供表格与报告使用。"""
+        order = {g: i for i, (g, _) in enumerate(GROUPS)}
+        items = sorted(self.items,
+                       key=lambda x: (order.get(x.get("group"), 99), x["id"]))
+        n = 0
+        out = []
+        for it in items:
+            n += 1
+            it = dict(it)
+            it["no"] = n
+            it["group_name"] = dict(GROUPS).get(it["group"], "其他")
+            out.append(it)
+        return out
 
 
 def summarize(r) -> dict:
-    """把检查项压成一份计数 + 判定，批量表格和退出码都用它。"""
+    """把检查项压成一份计数 + 判定，批量表格和退出码都用它。
+
+    SKIP 项默认已由 R.add 拦在items 之外（只记进 meta.skipped），
+    因此这里的 SKIP 计数恒为 0，保留字段只为兼容旧调用方。
+    """
     from collections import Counter
     c = Counter(i["status"] for i in r.items)
     s = {k: int(c.get(k, 0)) for k in ("PASS", "FAIL", "WARN", "SKIP")}
-    s["total"] = len(r.items)
+    s["skipped"] = int(r.meta.get("skipped", 0))
+    s["total"] = len(r.items)          # 实检项数（不含跳过）
+    s["total_all"] = s["total"] + s["skipped"]
     s["verdict"] = "FAIL" if s["FAIL"] else ("WARN" if s["WARN"] else "PASS")
     return s
 
@@ -470,6 +540,23 @@ def auto_checks(api: Api, r: R, model: str, do_collect: bool,
         _collect_round(api, r, expect_imu_hz=expect_imu_hz, expect_cam_hz=expect_cam_hz)
     else:
         r.add("E-D-005", "采集启停", "SKIP", "未加 --do-collect，跳过实测", "")
+
+    # ---- 数据质量与接口一致性增强检查（DQ-xxx 组）----
+    # 2026-10-08 新增。覆盖原体检没抓到的四类问题：
+    #   DQ-1xx 产物假成功（complete 但 0 字节 / 仍 .partial）
+    #   DQ-2xx 充电链路一致性（status 与电流符号矛盾）
+    #   DQ-3xx 状态字段自相矛盾（overall=healthy 但下层全 idle 等）
+    #   DQ-4xx 数据流质量（帧率/丢帧/写盘）—— 不启采也能读上一轮指标
+    #   DQ-5xx 只读 API 探针（相机型号/多网卡/存储/云端）
+    # 全程只读 GET，不改变设备状态；模块缺失时静默跳过，不影响原有体检。
+    try:
+        import dq_extra
+        _dq = dq_extra.run_all(getattr(api, "base", ""), h0, r)
+        # 把增强项数量并进 meta，批量汇总表可显示
+        r.meta["dq_extra"] = len(getattr(_dq, "own", []))
+    except Exception as exc:  # noqa: BLE001
+        r.add("DQ-000", "增强检查", "SKIP",
+              f"dq_extra 未启用或异常：{type(exc).__name__}", "")
 
 
 def _queue_history(api: Api, r: R) -> None:
@@ -874,6 +961,8 @@ def main() -> None:
     ap.add_argument("--password", default="", help="Livstudio 密码")
     ap.add_argument("--do-collect", action="store_true", help="实测一轮采集启停（会写文件）")
     ap.add_argument("--no-manual", action="store_true", help="跳过人工确认项")
+    ap.add_argument("--show-skip", action="store_true",
+                    help="报告里列出被跳过的项（默认只列实检项）")
     ap.add_argument("--upload", action="store_true", help="回填飞书表格")
     ap.add_argument("--dry-run", action="store_true")
     # --- 下面三个是给 batch_check.py 批量调度用的，人工单台跑不需要 ---
@@ -910,7 +999,7 @@ def main() -> None:
             # 报告要的设备身份字段必须落盘。
             json.dump({"host": args.host, "device": args.device,
                        "at": payload["at"], "summary": payload["summary"],
-                       "meta": r.meta, "items": r.items},
+                       "meta": r.meta, "items": r.numbered()},
                       f, ensure_ascii=False, indent=2)
         p = write_report(r, args.host, args.device)
         print(f"\nJSON -> {jp}")
@@ -929,13 +1018,14 @@ def _run_checks(args) -> dict:
     """跑一遍全部检查并返回可 JSON 序列化的结果。拆出来是为了让 main 便于包 redirect_stdout。"""
     api = Api(args.host, args.port)
     print(f"目标 {args.host}:{args.port}  只读体检{'' if args.do_collect else '（不启停采集）'}")
-    r = R()
+    # 默认隐藏 SKIP 项（报告只列实检项）；--show-skip 可把跳过项也列出来
+    r = R(hide_skip=not args.show_skip)
     auto_checks(api, r, args.model, args.do_collect, args.device_id, args.account, args.password)
     manual_checks(r, args.no_manual)
     _LAST_R[0] = r
     return {"host": args.host, "port": args.port, "device": args.device,
             "at": datetime.now().isoformat(timespec="seconds"),
-            "summary": summarize(r), "meta": r.meta, "items": r.items}
+            "summary": summarize(r), "meta": r.meta, "items": r.numbered()}
 
 
 if __name__ == "__main__":
