@@ -441,8 +441,27 @@ class CheckupPanel(Panel):
         self.table.setColumnWidth(1, 48)
         hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(3, QHeaderView.Stretch)
+        # 全混在一张表里，30 多行中找那几个失败要一行行翻。
+        # 勾上就只留失败/告警，定位问题直接看最上面几行。
+        self.only_problems = QCheckBox("只看问题项（隐藏通过 / 跳过）")
+        self.only_problems.toggled.connect(self._apply_filter)
+        root.addWidget(self.only_problems)
         self.table.setMaximumHeight(0)  # 先藏着，有结果再展开
         root.addWidget(self.table)
+
+    def _apply_filter(self) -> None:
+        on = self.only_problems.isChecked()
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, 0)
+            st = it.data(Qt.UserRole) if it else ""
+            self.table.setRowHidden(r, bool(on and st in ("PASS", "SKIP")))
+        self._fit_height()
+
+    def _fit_height(self) -> None:
+        """按可见行数收表格高度，免得隐藏后留一大片空白。"""
+        n = sum(1 for r in range(self.table.rowCount())
+                if not self.table.isRowHidden(r))
+        self.table.setMaximumHeight(min(240, 34 * n + 8) if n else 0)
 
     def reset_table(self) -> None:
         self.table.setRowCount(0)
@@ -485,6 +504,7 @@ class CheckupPanel(Panel):
         # 原来这里只放一个「●」，绿的黄的红的全靠颜色认——截图一压就分不清了。
         # 现在直接写「✔ 通过 / ! 告警 / ✘ 失败」，颜色退成辅助。
         st = QTableWidgetItem(ST_LABEL[status])
+        st.setData(Qt.UserRole, status)   # 供「只看问题项」筛选判断
         st.setForeground(QColor(col))
         f = st.font()
         f.setBold(True)
@@ -500,10 +520,12 @@ class CheckupPanel(Panel):
                 it.setForeground(QColor("#1f2530"))
             self.table.setItem(r, c, it)
         self._tally[status] += 1
+        if self.only_problems.isChecked() and status in ("PASS", "SKIP"):
+            self.table.setRowHidden(r, True)
 
     def on_finished(self, code: int) -> None:
         super().on_finished(code)
-        self.table.setMaximumHeight(240)
+        self._fit_height()
         t = self._tally
         total = sum(t.values())
         if total == 0:
@@ -898,6 +920,8 @@ class BatchPanel(Panel):
 
     def _on_done(self, recs: list) -> None:
         import batch_check
+        # 不合格排最前 —— 一连 17 台时，先看到的就是要处理的
+        recs = batch_check.order_recs(recs)
         self._recs = recs
         self._summary = batch_check.summarize_batch(recs)
         self._fill_table(recs)

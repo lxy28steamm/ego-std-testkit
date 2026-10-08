@@ -332,6 +332,27 @@ def summarize_batch(recs: list[dict]) -> dict:
             "verdict": "FAIL" if bad else ("WARN" if warn else "PASS")}
 
 
+def _ip_key(ip) -> tuple:
+    out = []
+    for x in str(ip or "").split("."):
+        out.append(int(x) if x.isdigit() else -1)
+    return tuple(out)
+
+
+_VERDICT_ORDER = {"FAIL": 0, "WARN": 1, "PASS": 2, "SKIP": 3}
+
+
+def order_recs(recs: list[dict]) -> list[dict]:
+    """不合格的排最前，合格的沉底 —— 打开报告第一眼就是待处理的设备。
+
+    之前按 IP 顺序平铺，17 台里 3 台不合格夹在中间要一行行找。
+    同一结论内仍按 IP 排，保证每次跑出来顺序稳定、方便对比历史。
+    幂等：可以重复调用，各处导出前都过一道，谁调都不会跑出另一种顺序。
+    """
+    return sorted(recs, key=lambda r: (_VERDICT_ORDER.get(r.get("verdict"), 9),
+                                       _ip_key(r.get("ip"))))
+
+
 COLS = [("ip", "IP", 125), ("sn", "设备SN", 165), ("version", "版本", 80),
         ("verdict", "结论", 65), ("state", "设备状态", 95),
         ("cameras", "相机", 50), ("profile", "Profile", 95),
@@ -351,6 +372,8 @@ def _cell(rec: dict, key: str) -> str:
 
 
 def export_html(recs: list[dict], path: str, s: dict) -> str:
+    recs = order_recs(recs)   # 不合格在前
+
     def row(rec: dict) -> str:
         cls = {"PASS": "ok", "WARN": "warn", "FAIL": "bad"}.get(rec["verdict"], "")
         tds = "".join(
@@ -358,12 +381,17 @@ def export_html(recs: list[dict], path: str, s: dict) -> str:
             f'{html.escape(_cell(rec, k))}</td>' for k, _, _ in COLS)
         return f'<tr class="{cls}">{tds}</tr>'
 
-    # 每台的失败项明细，展开可看
+    # 每台的待看项明细，展开可看（失败在前、告警在后；其余通过项只报个数）
     details = []
     for rec in recs:
-        bad = [i for i in rec.get("items", []) if i.get("status") in ("FAIL", "WARN")]
+        items = rec.get("items") or []
+        bad = [i for i in items if i.get("status") in ("FAIL", "WARN")]
+        bad.sort(key=lambda i: (0 if i.get("status") == "FAIL" else 1,
+                                i.get("no") or 0))
         if not bad and not rec.get("error"):
             continue
+        n_bad = sum(1 for i in bad if i.get("status") == "FAIL")
+        n_warn = len(bad) - n_bad
         li = "".join(
             f'<li><span class="no">#{i.get("no", "?")}</span>'
             f'<span class="tag {html.escape(i["status"])}">{i["status"]}</span>'
@@ -371,10 +399,16 @@ def export_html(recs: list[dict], path: str, s: dict) -> str:
             f'<span class="cid">{html.escape(i["id"])}</span>'
             f'<span class="d">{html.escape(str(i["detail"])[:200])}</span></li>'
             for i in bad)
+        rest = len(items) - len(bad)
+        if rest > 0:
+            li += f'<li class="rest">其余 {rest} 项 ✔ 通过（不展开）</li>'
         if rec.get("error"):
             li += f'<li><span class="tag bad">ERROR</span><span class="d">{html.escape(rec["error"])}</span></li>'
+        head_txt = ((f'{rec["ip"]} — ✘ 失败 {n_bad} · ! 告警 {n_warn}' if n_bad
+                     else f'{rec["ip"]} — ! 告警 {n_warn}') if bad
+                    else f'{rec["ip"]} — 连接异常')
         details.append(
-            f'<details><summary>{html.escape(rec["ip"])} — {len(bad)} 项待看</summary><ul>{li}</ul></details>')
+            f'<details><summary>{html.escape(head_txt)}</summary><ul>{li}</ul></details>')
 
     doc = f"""<!doctype html><html lang="zh"><meta charset="utf-8">
 <title>Ego-Std 批量巡检 {s['total']} 台</title>
@@ -417,10 +451,12 @@ def export_html(recs: list[dict], path: str, s: dict) -> str:
  .legend b{{color:#374151}}
  .legend span{{display:inline-block;margin-right:12px;font-weight:600}}
  .d{{color:#6b7280;font-size:12px}}
+ .rest{{color:#15803d;font-size:12px;list-style:none;margin-left:-12px}}
 </style>
 <h1>Ego-Std 批量巡检报告</h1>
 <div class="meta">生成时间 {html.escape(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}
- · 共 {s['total']} 台 · 并发只读体检 · 不启停采集</div>
+ · 共 {s['total']} 台 · 并发只读体检 · 不启停采集
+ · <b>表格按结论排序：不合格 → 告警 → 合格</b></div>
 <div class="legend">
  <b>结论标识：</b>
  <span style="color:#15803d">{ST_LABEL_EN['PASS']}</span>
@@ -447,6 +483,7 @@ def export_html(recs: list[dict], path: str, s: dict) -> str:
 
 
 def export_csv(recs: list[dict], path: str) -> str:
+    recs = order_recs(recs)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
@@ -471,6 +508,7 @@ def export_xlsx(recs: list[dict], path: str, s: dict) -> str:
         from openpyxl.utils import get_column_letter
     except ImportError:
         return ""
+    recs = order_recs(recs)   # 不合格在最前，和处理优先级一致
     wb = Workbook()
     ws = wb.active
     ws.title = "汇总"
@@ -481,7 +519,7 @@ def export_xlsx(recs: list[dict], path: str, s: dict) -> str:
     ws.append([f"生成时间 {datetime.now():%Y-%m-%d %H:%M:%S}  共 {s['total']} 台"
                f"  合格 {s['PASS']}  告警 {s['WARN']}  不合格 {s['FAIL']}"])
     ws.append(["结论标识：✔ PASS 通过　! WARN 告警　✘ FAIL 不合格"
-               "（以文字为准，底色仅作辅助）"])
+               "（以文字为准，底色仅作辅助）；表格按结论排序：不合格 → 告警 → 合格"])
     ws.append([])
     ws.append([t for _, t, _ in COLS])
     for c in range(1, len(COLS) + 1):
@@ -555,6 +593,7 @@ def _pad(s, n: int, right: bool = False) -> str:
 
 
 def _print_table(recs: list[dict], s: dict) -> None:
+    recs = order_recs(recs)   # 不合格排最前，扫描时先看要处理的
     # SN 和版本号是交付时对方一定要问的，放在最前面，别藏在备注里
     head = (f"{_pad('IP', 17)}{_pad('设备SN', 21)}{_pad('版本', 9)}{_pad('结论', 8)}"
             f"{_pad('状态', 11)}{_pad('相机', 5)}"

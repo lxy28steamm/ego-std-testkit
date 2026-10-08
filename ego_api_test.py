@@ -895,14 +895,42 @@ def write_report(r: R, host: str, device: str) -> str:
     # 报告主体用 numbered()：序号 = 执行顺序的 1..N，和控制台/GUI/JSON 完全同号。
     # 原始 ID（E-D-003 / DQ-401）降级成序号下面的灰色小字 —— 现场沟通直接说
     # 「第 12 项」，要回查飞书用例表时再看那行小字，不用在一串 ID 里找。
-    rows = "".join(
-        f"<tr class='row' data-st='{i['status']}'>"
-        f"<td class='no'><b>{i['no']}</b><i>{html.escape(i['id'])}</i></td>"
-        f"<td><span class='st' style='background:{color[i['status']][1]};"
-        f"color:{color[i['status']][0]}'>{ST_LABEL[i['status']]}"
-        f"<span class='en'>{i['status']}</span></span></td>"
-        f"<td>{html.escape(i['name'])}</td><td>{html.escape(i['detail'])}</td>"
-        f"<td><code>{html.escape(i['src'])}</code></td></tr>" for i in r.numbered())
+    # 分区排版：把「需要关注」（失败 + 告警）提到最前，通过项沉到后面。
+    # 之前 30 多行混排，2 个失败夹在中间，现场要一行行找 —— 分区后打开
+    # 报告第一眼就是问题项。序号仍是执行顺序的 1..N（不重编），所以
+    # 「第 14 项」在报告/控制台/GUI 里还是同一条。
+    numbered = r.numbered()
+    buckets = {"FAIL": [], "WARN": [], "PASS": [], "SKIP": []}
+    for i in numbered:
+        buckets[i["status"]].append(i)
+
+    def grp_row(key: str, title: str, note: str) -> str:
+        return (f"<tr class='grp {key}' data-grp='{key}'><td colspan='5'>"
+                f"{title}<span class='cnt'>{note}</span></td></tr>")
+
+    def row_html(i: dict, gkey: str) -> str:
+        c = color[i["status"]]
+        return (f"<tr class='row' data-st='{i['status']}' data-grp='{gkey}'>"
+                f"<td class='no'><b>{i['no']}</b><i>{html.escape(i['id'])}</i></td>"
+                f"<td><span class='st' style='background:{c[1]};color:{c[0]}'>"
+                f"{ST_LABEL[i['status']]}"
+                f"<span class='en'>{i['status']}</span></span></td>"
+                f"<td>{html.escape(i['name'])}</td><td>{html.escape(i['detail'])}</td>"
+                f"<td><code>{html.escape(i['src'])}</code></td></tr>")
+
+    parts: list[str] = []
+    need = buckets["FAIL"] + buckets["WARN"]     # 失败在前，同组按序号
+    if need:
+        parts.append(grp_row("need", "⚠ 需要关注", " %d 项 · 失败 %d · 告警 %d"
+                             % (len(need), len(buckets["FAIL"]), len(buckets["WARN"]))))
+        parts += [row_html(i, "need") for i in need]
+    if buckets["PASS"]:
+        parts.append(grp_row("ok", "✔ 通过", " %d 项" % len(buckets["PASS"])))
+        parts += [row_html(i, "ok") for i in buckets["PASS"]]
+    if buckets["SKIP"]:
+        parts.append(grp_row("skip", "- 跳过", " %d 项" % len(buckets["SKIP"])))
+        parts += [row_html(i, "skip") for i in buckets["SKIP"]]
+    rows = "".join(parts)
     doc = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>Ego-Std API 检查 {html.escape(device)}</title><style>
 body{{font:14px/1.6 system-ui,'Segoe UI',sans-serif;margin:0;padding:28px;color:#222;background:#fff}}
@@ -939,6 +967,13 @@ td.no{{width:74px;text-align:center;line-height:1.25}}
 td.no b{{display:block;font-size:15px;font-weight:600;color:#14181f}}
 td.no i{{display:block;font-style:normal;font-size:10px;color:#b3afa6;
 font-family:ui-monospace,Consolas,monospace;word-break:break-all}}
+/* 分区标题行：把「需要关注」和「通过」隔开，定位问题时不用逐行翻 */
+tr.grp td{{background:#eceae4;font-weight:600;font-size:12.5px;color:#4a4941;
+padding:7px 10px}}
+tr.grp .cnt{{font-weight:400;color:#8d8878;margin-left:6px}}
+tr.grp.need td{{background:#fbece7;color:#9c3a24}}
+tr.grp.ok td{{background:#eaf2e4;color:#3f6b2a}}
+tr.grp.skip td{{background:#f1f1ef;color:#6b7280}}
 </style></head><body>
 <h1>LivUmi-Ego-Std 设备体检报告</h1>
 <div class="meta">主机 {html.escape(host)} ·
@@ -963,11 +998,13 @@ font-family:ui-monospace,Consolas,monospace;word-break:break-all}}
 <span>（符号与文字为准，颜色仅作辅助）</span>
 </div>
 <div class="legend" style="margin-top:-6px">
-<span>共 {len(r.items)} 项，按序号 1…{len(r.items)} 对照控制台/表格同一行；
-序号下面的灰色小字是原始用例号（对飞书用例表用，平时不用看）。</span>
+<span>共 {len(r.items)} 项，分两区读：上面<b>「需要关注」</b>是失败和告警，
+下面<b>「通过」</b>是没问题的，不用逐行翻。序号 1…{len(r.items)}
+对控制台/表格同一行；序号下的灰色小字是原始用例号（对飞书用例表用）。</span>
 </div>
 <div class="bar">
 <button data-f="ALL" class="on">全部</button>
+<button data-f="NEED">只看需要关注</button>
 <button data-f="PASS">只看 {ST_LABEL['PASS']}</button>
 <button data-f="FAIL">只看 {ST_LABEL['FAIL']}</button>
 <button data-f="WARN">只看 {ST_LABEL['WARN']}</button>
@@ -978,11 +1015,24 @@ font-family:ui-monospace,Consolas,monospace;word-break:break-all}}
 <tbody>{rows}</tbody></table>
 <script>
 var bs=[].slice.call(document.querySelectorAll('.bar button'));
+var rows=[].slice.call(document.querySelectorAll('tr.row'));
+var grps=[].slice.call(document.querySelectorAll('tr.grp'));
+var NEED=['FAIL','WARN'];
+function match(tr,f){{
+  if(f==='ALL') return true;
+  if(f==='NEED') return NEED.indexOf(tr.dataset.st)>=0;
+  return tr.dataset.st===f;
+}}
 bs.forEach(function(b){{b.onclick=function(){{
   var f=b.dataset.f;
   bs.forEach(function(x){{x.classList.toggle('on',x===b)}});
-  [].slice.call(document.querySelectorAll('tr.row')).forEach(function(tr){{
-    tr.classList.toggle('hide', f!=='ALL' && tr.dataset.st!==f);
+  rows.forEach(function(tr){{tr.classList.toggle('hide',!match(tr,f))}});
+  // 分区标题跟着自己那一区一起显隐，空了就藏起来
+  grps.forEach(function(g){{
+    var n=rows.filter(function(tr){{
+      return tr.dataset.grp===g.dataset.grp && !tr.classList.contains('hide');
+    }}).length;
+    g.classList.toggle('hide', n===0);
   }});
 }}}});
 </script></body></html>"""
