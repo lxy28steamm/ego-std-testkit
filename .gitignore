@@ -16,6 +16,9 @@ export/
 *.csv
 *.log
 
+# 单台巡检的临时结果（_f.json 等，含设备 IP / SN，不入库）
+_*.json
+
 # 本机设备地址（含内网 IP，不入库）
 device_ip.txt
 

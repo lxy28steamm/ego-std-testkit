@@ -201,6 +201,15 @@ class R:
         return out
 
 
+# ---- 状态文字标识（报告 / GUI / 导出通用）---------------------------------
+# 只看颜色区分不了——黑白打印、截图压缩、色觉障碍三种场景都会翻车。
+# 所以每处状态一律「符号 + 中文 + 英文缩写」三重标识，颜色降级为辅助信息。
+ST_ICON = {"PASS": "✔", "FAIL": "✘", "WARN": "!", "SKIP": "-"}
+ST_CN = {"PASS": "通过", "FAIL": "失败", "WARN": "告警", "SKIP": "跳过"}
+ST_LABEL = {k: f"{ST_ICON[k]} {ST_CN[k]}" for k in ST_ICON}          # 表格里显示
+ST_LABEL_FULL = {k: f"{ST_ICON[k]} {ST_CN[k]} {k}" for k in ST_ICON}  # 图例里显示
+
+
 def summarize(r) -> dict:
     """把检查项压成一份计数 + 判定，批量表格和退出码都用它。
 
@@ -879,8 +888,10 @@ def write_report(r: R, host: str, device: str) -> str:
     color = {"PASS": ("#27500A", "#EAF3DE"), "FAIL": ("#791F1F", "#FCEBEB"),
              "WARN": ("#633806", "#FAEEDA"), "SKIP": ("#666", "#F1F1EF")}
     rows = "".join(
-        f"<tr class='row' data-st='{i['status']}'><td style='background:{color[i['status']][1]};"
-        f"color:{color[i['status']][0]};font-weight:500'>{i['status']}</td>"
+        f"<tr class='row' data-st='{i['status']}'><td>"
+        f"<span class='st' style='background:{color[i['status']][1]};"
+        f"color:{color[i['status']][0]}'>{ST_LABEL[i['status']]}"
+        f"<span class='en'>{i['status']}</span></span></td>"
         f"<td><code>{html.escape(i['id'])}</code></td>"
         f"<td>{html.escape(i['name'])}</td><td>{html.escape(i['detail'])}</td>"
         f"<td><code>{html.escape(i['src'])}</code></td></tr>" for i in r.items)
@@ -908,6 +919,13 @@ tr.hide{{display:none}}
 .idbox .k{{color:#666;font-size:11px;margin-bottom:3px}}
 .idbox .v{{font-family:ui-monospace,Consolas,monospace;font-size:14px;font-weight:600;color:#14181f;
 word-break:break-all}}
+/* 状态标识：符号+中文是主判据，底色只是辅助；.en 是给对号入座用的英文缩写 */
+.st{{display:inline-block;white-space:nowrap;border-radius:5px;padding:2px 8px;
+font-weight:600;font-size:12px}}
+.st .en{{opacity:.55;font-size:10px;margin-left:5px;font-weight:500}}
+.legend{{margin:0 0 14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+font-size:12px;color:#666}}
+.legend b{{color:#333;font-weight:600}}
 </style></head><body>
 <h1>LivUmi-Ego-Std 设备体检报告</h1>
 <div class="meta">主机 {html.escape(host)} ·
@@ -920,17 +938,23 @@ word-break:break-all}}
 </div>
 <div class="cards">
 <div class="card"><b>{len(r.items)}</b>检查项</div>
-<div class="card"><b style="color:#27500A">{tally['PASS']}</b>通过</div>
-<div class="card"><b style="color:#A32D2D">{tally['FAIL']}</b>失败</div>
-<div class="card"><b style="color:#BA7517">{tally['WARN']}</b>告警</div>
-<div class="card"><b style="color:#666">{tally['SKIP']}</b>跳过</div>
+<div class="card"><b style="color:#27500A">{tally['PASS']}</b>{ST_LABEL_FULL['PASS']}</div>
+<div class="card"><b style="color:#A32D2D">{tally['FAIL']}</b>{ST_LABEL_FULL['FAIL']}</div>
+<div class="card"><b style="color:#BA7517">{tally['WARN']}</b>{ST_LABEL_FULL['WARN']}</div>
+<div class="card"><b style="color:#666">{tally['SKIP']}</b>{ST_LABEL_FULL['SKIP']}</div>
+</div>
+<div class="legend">
+<b>结果标识：</b>
+{''.join(f"<span class='st' style='background:{color[k][1]};color:{color[k][0]}'>"
+         f"{ST_LABEL_FULL[k]}</span>" for k in ('PASS', 'WARN', 'FAIL', 'SKIP'))}
+<span>（符号与文字为准，颜色仅作辅助）</span>
 </div>
 <div class="bar">
 <button data-f="ALL" class="on">全部</button>
-<button data-f="PASS">只看过项</button>
-<button data-f="FAIL">只看失败</button>
-<button data-f="WARN">只看告警</button>
-<button data-f="SKIP">只看跳过</button>
+<button data-f="PASS">只看 {ST_LABEL['PASS']}</button>
+<button data-f="FAIL">只看 {ST_LABEL['FAIL']}</button>
+<button data-f="WARN">只看 {ST_LABEL['WARN']}</button>
+<button data-f="SKIP">只看 {ST_LABEL['SKIP']}</button>
 <span class="hint">点按钮筛选表格行</span>
 </div>
 <table><thead><tr><th>结果</th><th>编号</th><th>项目</th><th>详情</th><th>来源</th></tr></thead>

@@ -40,6 +40,12 @@ DEVICE_FILE = os.path.join(BASE_DIR, "device_ip.txt")
 ENGINE = os.path.join(BASE_DIR, "ego_api_test.py")
 API_PORT_DEFAULT = 18000
 
+# 状态文字标识（与 ego_api_test.ST_LABEL* 保持一致）。
+# 报告一旦离开屏幕（截图、黑白打印、转发到飞书）颜色就可能丢，
+# 所以每处结论一律「符号 + 英文缩写」双标，颜色只作辅助。
+ST_LABEL = {"PASS": "✔ 通过", "FAIL": "✘ 失败", "WARN": "! 告警", "SKIP": "- 跳过"}
+ST_LABEL_EN = {"PASS": "✔ PASS", "FAIL": "✘ FAIL", "WARN": "! WARN", "SKIP": "- SKIP"}
+
 sys.path.insert(0, BASE_DIR)
 
 
@@ -338,13 +344,18 @@ def _cell(rec: dict, key: str) -> str:
     v = rec.get(key, "")
     if v is None:
         return ""
+    # 结论列一律带符号 —— HTML/CSV/Excel 三个导出都走这里，改一处全生效
+    if key == "verdict":
+        return ST_LABEL_EN.get(str(v), str(v))
     return str(v)
 
 
 def export_html(recs: list[dict], path: str, s: dict) -> str:
     def row(rec: dict) -> str:
         cls = {"PASS": "ok", "WARN": "warn", "FAIL": "bad"}.get(rec["verdict"], "")
-        tds = "".join(f"<td>{html.escape(_cell(rec, k))}</td>" for k, _, _ in COLS)
+        tds = "".join(
+            f'<td{" class=\'vd\'" if k == "verdict" else ""}>'
+            f'{html.escape(_cell(rec, k))}</td>' for k, _, _ in COLS)
         return f'<tr class="{cls}">{tds}</tr>'
 
     # 每台的失败项明细，展开可看
@@ -391,11 +402,27 @@ def export_html(recs: list[dict], path: str, s: dict) -> str:
  .tag{{display:inline-block;min-width:44px;text-align:center;padding:1px 5px;border-radius:4px;
    font-size:11px;margin-right:6px;color:#fff;background:#9ca3af}}
  .tag.PASS{{background:#16a34a}} .tag.WARN{{background:#f59e0b}} .tag.FAIL{{background:#dc2626}}
+ /* 结论列：文字标识为主，颜色只作辅助（截图/黑白打印也不会丢信息） */
+ .vd{{font-weight:700;white-space:nowrap}}
+ tr.ok   .vd{{color:#15803d}}
+ tr.warn .vd{{color:#b45309}}
+ tr.bad  .vd{{color:#b91c1c}}
+ .legend{{margin:0 0 14px;font-size:12px;color:#6b7280}}
+ .legend b{{color:#374151}}
+ .legend span{{display:inline-block;margin-right:12px;font-weight:600}}
  .d{{color:#6b7280;font-size:12px}}
 </style>
 <h1>Ego-Std 批量巡检报告</h1>
 <div class="meta">生成时间 {html.escape(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}
  · 共 {s['total']} 台 · 并发只读体检 · 不启停采集</div>
+<div class="legend">
+ <b>结论标识：</b>
+ <span style="color:#15803d">{ST_LABEL_EN['PASS']}</span>
+ <span style="color:#b45309">{ST_LABEL_EN['WARN']}</span>
+ <span style="color:#b91c1c">{ST_LABEL_EN['FAIL']}</span>
+ <span style="color:#6b7280">{ST_LABEL_EN['SKIP']}</span>
+ <span style="color:#9ca3af;font-weight:400">（以符号和文字为准，颜色仅作辅助）</span>
+</div>
 <div class="cards">
  <div class="card"><b>{s['total']}</b><span>设备总数</span></div>
  <div class="card ok"><b>{s['PASS']}</b><span>合格 PASS</span></div>
@@ -405,7 +432,7 @@ def export_html(recs: list[dict], path: str, s: dict) -> str:
 <table><thead><tr>{''.join(f'<th>{t}</th>' for _, t, _ in COLS)}</tr></thead>
 <tbody>{''.join(row(r) for r in recs)}</tbody></table>
 <h2>待看明细</h2>
-{''.join(details) if details else '<p style="color:#15803d">全部设备 18 项全通过，无待看项。</p>'}
+{''.join(details) if details else '<p style="color:#15803d">✔ 全部设备无失败/告警项，可直接交付。</p>'}
 </html>"""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -446,26 +473,37 @@ def export_xlsx(recs: list[dict], path: str, s: dict) -> str:
     ws["A1"].font = Font(bold=True, size=14)
     ws.append([f"生成时间 {datetime.now():%Y-%m-%d %H:%M:%S}  共 {s['total']} 台"
                f"  合格 {s['PASS']}  告警 {s['WARN']}  不合格 {s['FAIL']}"])
+    ws.append(["结论标识：✔ PASS 通过　! WARN 告警　✘ FAIL 不合格"
+               "（以文字为准，底色仅作辅助）"])
     ws.append([])
     ws.append([t for _, t, _ in COLS])
     for c in range(1, len(COLS) + 1):
-        cell = ws.cell(row=4, column=c)
+        cell = ws.cell(row=5, column=c)
         cell.fill, cell.font = head_fill, head_font
         cell.alignment = Alignment(horizontal="center")
     vfill = {"PASS": PatternFill("solid", fgColor="C6EFCE"),
              "WARN": PatternFill("solid", fgColor="FFEB9C"),
              "FAIL": PatternFill("solid", fgColor="FFC7CE")}
+    vfont = {"PASS": Font(color="0B6B2E", bold=True),
+             "WARN": Font(color="8A5200", bold=True),
+             "FAIL": Font(color="9C1C1C", bold=True)}
+    # 结论列在 COLS 里的位置（0-based → openpyxl 列号要 +1）
+    vcol = next(i for i, (k, _, _) in enumerate(COLS, start=1) if k == "verdict")
     for r in recs:
         ws.append([_cell(r, k) for k, _, _ in COLS])
         row_i = ws.max_row
         v = vfill.get(r["verdict"])
         if v:
-            ws.cell(row=row_i, column=2).fill = v
+            # 原来这里写的是 column=2，涂到了「设备SN」上 —— 结论列反而是白的。
+            c = ws.cell(row=row_i, column=vcol)
+            c.fill = v
+            c.font = vfont.get(r["verdict"], Font())
+            c.alignment = Alignment(horizontal="center")
         for c in range(1, len(COLS) + 1):
             ws.cell(row=row_i, column=c).border = None
     for i, (_, _, w) in enumerate(COLS, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w / 7.2
-    ws.freeze_panes = "A5"
+    ws.freeze_panes = "A6"
 
     ws2 = wb.create_sheet("失败明细")
     ws2.append(["IP", "状态", "ID", "检查项", "详情", "来源接口"])
@@ -475,8 +513,14 @@ def export_xlsx(recs: list[dict], path: str, s: dict) -> str:
     for r in recs:
         for i in r.get("items", []):
             if i.get("status") in ("FAIL", "WARN"):
-                ws2.append([r["ip"], i["status"], i["id"], i["name"],
+                ws2.append([r["ip"], ST_LABEL_EN.get(i["status"], i["status"]),
+                            i["id"], i["name"],
                             str(i["detail"])[:500], i.get("src", "")])
+                st_cell = ws2.cell(row=ws2.max_row, column=2)
+                if i["status"] in vfill:
+                    st_cell.fill = vfill[i["status"]]
+                    st_cell.font = vfont[i["status"]]
+                st_cell.alignment = Alignment(horizontal="center")
     for i, w in enumerate([16, 8, 12, 16, 90, 34], start=1):
         ws2.column_dimensions[get_column_letter(i)].width = w
     ws2.freeze_panes = "A2"
@@ -517,12 +561,13 @@ def _print_table(recs: list[dict], s: dict) -> None:
             bad = [f"{i['id']}" for i in r.get("items", []) if i.get("status") == "FAIL"]
             note = ("失败:" + ",".join(bad[:4])) if bad else ""
         print(f"{_pad(r['ip'], 17)}{_pad(str(r.get('sn', '')), 21)}"
-              f"{_pad(str(r.get('version', '')), 9)}{_pad(r['verdict'], 8)}"
+              f"{_pad(str(r.get('version', '')), 9)}"
+              f"{_pad(ST_LABEL_EN.get(r['verdict'], r['verdict']), 8)}"
               f"{_pad(str(r.get('state', ''))[:9], 11)}{_pad(str(r.get('cameras', '')), 5)}"
               f"{_pad(r['PASS'], 5, True)}{_pad(r['FAIL'], 5, True)}{_pad(r['WARN'], 5, True)}"
               f"{_pad(r['secs'], 7, True)}  {note[:36]}")
     print("=" * 118)
-    print(f"共 {s['total']} 台：合格 {s['PASS']} / 告警 {s['WARN']} / 不合格 {s['FAIL']}")
+    print(f"共 {s['total']} 台：✔合格 {s['PASS']} / !告警 {s['WARN']} / ✘不合格 {s['FAIL']}")
 
 
 def main() -> None:
@@ -578,8 +623,8 @@ def main() -> None:
     t0 = time.time()
 
     def prog(done: int, total: int, rec: dict) -> None:
-        flag = {"PASS": "OK  ", "WARN": "WARN", "FAIL": "FAIL"}[rec["verdict"]]
-        print(f"  [{done}/{total}] {flag} {rec['ip']}  {rec['secs']}s  "
+        flag = ST_LABEL_EN.get(rec["verdict"], rec["verdict"])
+        print(f"  [{done}/{total}] {flag:<6} {rec['ip']}  {rec['secs']}s  "
               f"P{rec['PASS']}/F{rec['FAIL']}/W{rec['WARN']}"
               + (f"  {rec['error'][:60]}" if rec.get("error") else ""))
 

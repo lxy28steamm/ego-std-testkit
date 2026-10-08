@@ -47,6 +47,11 @@ FLAG2STATUS = {"+": "PASS", "x": "FAIL", "!": "WARN", "-": "SKIP"}
 C_OK, C_BAD, C_WARN, C_SKIP = "#1a7f37", "#c62828", "#b26a00", "#6b7280"
 BG_OK, BG_BAD, BG_WARN, BG_SKIP = "#e8f5e9", "#fdecea", "#fff5e5", "#f2f3f5"
 
+# 状态文字标识：不能只靠颜色区分（黑白截图/压缩/色觉障碍都会失效）。
+# 每个状态一律「符号 + 中文」，颜色只当辅助。
+ST_LABEL = {"PASS": "✔ 通过", "FAIL": "✘ 失败", "WARN": "! 告警", "SKIP": "- 跳过"}
+ST_LABEL_EN = {"PASS": "✔ PASS", "FAIL": "✘ FAIL", "WARN": "! WARN", "SKIP": "- SKIP"}
+
 MONO = "Consolas"
 
 
@@ -398,7 +403,7 @@ class CheckupPanel(Panel):
         root.addWidget(self.banner)
 
         self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["", "编号", "检查项", "详情"])
+        self.table.setHorizontalHeaderLabels(["结果", "编号", "检查项", "详情"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -406,7 +411,7 @@ class CheckupPanel(Panel):
         self.table.setAlternatingRowColors(False)
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.Fixed)
-        self.table.setColumnWidth(0, 34)
+        self.table.setColumnWidth(0, 74)
         hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(3, QHeaderView.Stretch)
@@ -449,13 +454,15 @@ class CheckupPanel(Panel):
         col = {"PASS": C_OK, "FAIL": C_BAD, "WARN": C_WARN, "SKIP": C_SKIP}[status]
         r = self.table.rowCount()
         self.table.insertRow(r)
-        dot = QTableWidgetItem({"PASS": "●", "FAIL": "●", "WARN": "●", "SKIP": "○"}[status])
-        dot.setForeground(QColor(col))
-        f = dot.font()
-        f.setPointSize(12)
-        dot.setFont(f)
-        dot.setTextAlignment(Qt.AlignCenter)
-        cells = [dot, QTableWidgetItem(cid), QTableWidgetItem(name), QTableWidgetItem(detail)]
+        # 原来这里只放一个「●」，绿的黄的红的全靠颜色认——截图一压就分不清了。
+        # 现在直接写「✔ 通过 / ! 告警 / ✘ 失败」，颜色退成辅助。
+        st = QTableWidgetItem(ST_LABEL[status])
+        st.setForeground(QColor(col))
+        f = st.font()
+        f.setBold(True)
+        st.setFont(f)
+        st.setTextAlignment(Qt.AlignCenter)
+        cells = [st, QTableWidgetItem(cid), QTableWidgetItem(name), QTableWidgetItem(detail)]
         for c, it in enumerate(cells):
             it.setBackground(QColor(bg))
             if c in (1, 2, 3):
@@ -635,7 +642,8 @@ class BatchPanel(Panel):
         # --- 结果表 ---
         self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels(
-            ["IP", "结论", "版本", "状态", "相机", "通过", "失败", "告警", "耗时"])
+            ["IP", "结论", "版本", "状态", "相机",
+             "✔通过", "✘失败", "!告警", "耗时"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -911,7 +919,8 @@ class BatchPanel(Panel):
             fg = {"PASS": C_OK, "WARN": C_WARN}.get(verdict, C_BAD)
             cells = [
                 rec["ip"],
-                verdict,
+                # 结论列带上符号，别只靠底色 —— 截图/黑白打印时底色会丢
+                ST_LABEL_EN.get(verdict, verdict),
                 rec.get("version") or "-",
                 str(rec.get("state") or "-")[:12],
                 str(rec.get("cameras", "")),
