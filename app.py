@@ -1101,7 +1101,48 @@ class CollectPanel(Panel):
         g.addWidget(self.chk_keep, 2, 0, 1, 2)
 
         g.addWidget(QLabel("密码在启动后于命令行输入（不写进代码、不留 shell 历史）"), 2, 2, 1, 2)
+
+        # 现场反馈：选了「完整：采集 + 上传」但没填云账号，命令却变成 --skip-upload，
+        # 界面上没有任何交代（静默降级）。这里把「本次实际会怎么跑」显式写出来，
+        # 并与 build_args 共用 _effective()，不搞两套判定。
+        self.mode_hint = QLabel()
+        self.mode_hint.setWordWrap(True)
+        self.mode_hint.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        g.addWidget(self.mode_hint, 3, 0, 1, 4)
+        self.acct.textChanged.connect(self._sync_mode_hint)
+        self.mode.currentIndexChanged.connect(self._sync_mode_hint)
+        self._sync_mode_hint()
+
         g.setColumnStretch(1, 1)
+
+    def _effective(self) -> tuple[str, str]:
+        """算出「本次实际会怎么跑」——用户选的方式可能因缺云账号被降级。
+
+        返回 (实际方式, 一句人话说明)。界面提示与 build_args 共用这一套判定，
+        避免「提示说上传、命令却 --skip-upload」这种两处逻辑漂移。
+
+        为什么账号为空要降级而不是直接报错：上传必须带账号，没账号只能采。
+        但降级必须让用户看得见——静默降级会让人以为传了、其实没传，
+        白采一轮数据。
+        """
+        acct = self.acct.text().strip()
+        mode = self.mode.currentData()
+        if mode == "dry":
+            return "dry", "只读检查：不采集、不上传"
+        if mode == "collect":
+            return "collect", "只采集，不上传"
+        # mode == "full"
+        if not acct:
+            return "collect", ("选了「采集 + 上传」但云账号为空 —— "
+                               "会自动降级成「只采集，不上传」")
+        return "full", f"采集并上传到云账号 {acct}"
+
+    def _sync_mode_hint(self) -> None:
+        eff, why = self._effective()
+        color = {"full": C_OK, "collect": C_WARN, "dry": "#5b6472"}[eff]
+        icon = {"full": "✔ ", "collect": "! ", "dry": "- "}[eff]
+        self.mode_hint.setStyleSheet(f"color:{color};font-size:12px")
+        self.mode_hint.setText(f"{icon}本次实际执行：{why}")
 
     def build_args(self) -> list[str]:
         args = ["collect_and_upload.py", "--seconds", str(self.secs.value())]
@@ -1109,13 +1150,13 @@ class CollectPanel(Panel):
         if h:
             args += ["--host", h]
         acct = self.acct.text().strip()
-        mode = self.mode.currentData()
-        if mode == "dry":
+        eff, _ = self._effective()
+        if eff == "dry":
             args += ["--dry-run"]
             # dry-run 也需要账号才能查任务/目录
             if acct:
                 args += ["--account", acct]
-        elif mode == "collect" or not acct:
+        elif eff == "collect":
             args += ["--skip-upload"]
         else:
             args += ["--account", acct]
@@ -1131,12 +1172,23 @@ class CollectPanel(Panel):
         if "--dry-run" in args:
             super().on_run()
             return
-        need_acct = "--skip-upload" not in args
-        what = "采集并上传到云端" if need_acct else f"采集 {self.secs.value()} 秒（不上传）"
+        eff, _ = self._effective()
+        need_acct = eff == "full"
+        acct = self.acct.text().strip()
+        what = (f"采集并上传到云端（账号 {acct}）" if need_acct
+                else f"采集 {self.secs.value()} 秒（不上传）")
+        # 选了「采集 + 上传」却因账号空被降级：单独给一行醒目警告。
+        # 这种情况用户最可能没意识到，等事后才发现数据没进云端就晚了。
+        warn = ""
+        if not need_acct and self.mode.currentData() == "full":
+            warn = ("\n⚠ 注意：你选的是「采集 + 上传」，但云账号没填，\n"
+                    "   本次会降级成「只采集，不上传」——数据不会进云端。\n"
+                    "   要上传请先填云账号再开始。\n")
         yes = QMessageBox.question(
             self, "确认开始采传",
-            f"将对设备执行：{what}\n\n"
-            "· 采集期间请勿拔相机、勿断电\n"
+            f"将对设备执行：{what}\n"
+            + warn
+            + "\n· 采集期间请勿拔相机、勿断电\n"
             + ("· 上传完成后设备上的本地 mcap 会被删除\n" if need_acct and not self.chk_keep.isChecked() else "")
             + ("· 密码将在命令行里输入，不会写进代码\n" if need_acct else ""),
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
