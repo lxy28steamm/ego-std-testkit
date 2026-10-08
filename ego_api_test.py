@@ -170,6 +170,7 @@ class R:
         self.items: list[dict] = []
         self.meta: dict = {}   # 版本/状态/profile/相机数等，批量汇总时直接取用
         self.hide_skip = hide_skip   # SKIP 不进 items（进 meta.skipped），报告只列实检项
+        self._seq = 0              # 执行顺序序号，1 起；控制台/GUI/报告/JSON 共用同一个号
 
     def add(self, cid, name, status, detail, src=""):
         rec = {"id": cid, "name": name, "status": status,
@@ -180,23 +181,27 @@ class R:
             self.meta["skipped"] = self.meta.get("skipped", 0) + 1
             self.meta.setdefault("skipped_ids", []).append(f"{cid} {name}")
             return
+        # 只给"真的会显示出来"的项编号，跳过的项不占号 —— 这样清单里 1..N 连续无空洞
+        self._seq += 1
+        rec["seq"] = self._seq
         self.items.append(rec)
         flag = {"PASS": "+", "FAIL": "x", "WARN": "!", "SKIP": "-"}[status]
-        # 展示用统一编号：组内序号（+ 原始 ID 后缀），便于按序核对
-        print(f"  [{flag}] {cid:<13} {name:<12} {status:<4} {detail}")
+        # 现场沟通直接说「第 12 项」——原始 ID（E-D-003 / DQ-401）挪进 JSON 和报告小字，
+        # 不再占控制台最显眼的那一列。
+        print(f"  [{flag}] {self._seq:>3}. {name:<14} {status:<4} {detail}")
 
     def numbered(self) -> list[dict]:
-        """按分组排序并编上全局序号，供表格与报告使用。"""
-        order = {g: i for i, (g, _) in enumerate(GROUPS)}
-        items = sorted(self.items,
-                       key=lambda x: (order.get(x.get("group"), 99), x["id"]))
-        n = 0
+        """按执行顺序编号，供表格、报告与 JSON 共用。
+
+        2026-10-08 起不再按分组重排：分组排序会让报告序号和控制台/GUI 的
+        实时流水号对不上，现场对号入座时就懵了。group/group_name 仍照常带上，
+        需要分组视图时再按它渲染即可。
+        """
         out = []
-        for it in items:
-            n += 1
+        for it in self.items:
             it = dict(it)
-            it["no"] = n
-            it["group_name"] = dict(GROUPS).get(it["group"], "其他")
+            it["no"] = it.get("seq", len(out) + 1)
+            it["group_name"] = dict(GROUPS).get(it.get("group"), "其他")
             out.append(it)
         return out
 
@@ -887,14 +892,17 @@ def write_report(r: R, host: str, device: str) -> str:
         tally[it["status"]] += 1
     color = {"PASS": ("#27500A", "#EAF3DE"), "FAIL": ("#791F1F", "#FCEBEB"),
              "WARN": ("#633806", "#FAEEDA"), "SKIP": ("#666", "#F1F1EF")}
+    # 报告主体用 numbered()：序号 = 执行顺序的 1..N，和控制台/GUI/JSON 完全同号。
+    # 原始 ID（E-D-003 / DQ-401）降级成序号下面的灰色小字 —— 现场沟通直接说
+    # 「第 12 项」，要回查飞书用例表时再看那行小字，不用在一串 ID 里找。
     rows = "".join(
-        f"<tr class='row' data-st='{i['status']}'><td>"
-        f"<span class='st' style='background:{color[i['status']][1]};"
+        f"<tr class='row' data-st='{i['status']}'>"
+        f"<td class='no'><b>{i['no']}</b><i>{html.escape(i['id'])}</i></td>"
+        f"<td><span class='st' style='background:{color[i['status']][1]};"
         f"color:{color[i['status']][0]}'>{ST_LABEL[i['status']]}"
         f"<span class='en'>{i['status']}</span></span></td>"
-        f"<td><code>{html.escape(i['id'])}</code></td>"
         f"<td>{html.escape(i['name'])}</td><td>{html.escape(i['detail'])}</td>"
-        f"<td><code>{html.escape(i['src'])}</code></td></tr>" for i in r.items)
+        f"<td><code>{html.escape(i['src'])}</code></td></tr>" for i in r.numbered())
     doc = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>Ego-Std API 检查 {html.escape(device)}</title><style>
 body{{font:14px/1.6 system-ui,'Segoe UI',sans-serif;margin:0;padding:28px;color:#222;background:#fff}}
@@ -926,6 +934,11 @@ font-weight:600;font-size:12px}}
 .legend{{margin:0 0 14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;
 font-size:12px;color:#666}}
 .legend b{{color:#333;font-weight:600}}
+/* 序号列：大号数字是主引用（「第 12 项」），下面灰色小字是原始用例号 */
+td.no{{width:74px;text-align:center;line-height:1.25}}
+td.no b{{display:block;font-size:15px;font-weight:600;color:#14181f}}
+td.no i{{display:block;font-style:normal;font-size:10px;color:#b3afa6;
+font-family:ui-monospace,Consolas,monospace;word-break:break-all}}
 </style></head><body>
 <h1>LivUmi-Ego-Std 设备体检报告</h1>
 <div class="meta">主机 {html.escape(host)} ·
@@ -949,6 +962,10 @@ font-size:12px;color:#666}}
          f"{ST_LABEL_FULL[k]}</span>" for k in ('PASS', 'WARN', 'FAIL', 'SKIP'))}
 <span>（符号与文字为准，颜色仅作辅助）</span>
 </div>
+<div class="legend" style="margin-top:-6px">
+<span>共 {len(r.items)} 项，按序号 1…{len(r.items)} 对照控制台/表格同一行；
+序号下面的灰色小字是原始用例号（对飞书用例表用，平时不用看）。</span>
+</div>
 <div class="bar">
 <button data-f="ALL" class="on">全部</button>
 <button data-f="PASS">只看 {ST_LABEL['PASS']}</button>
@@ -957,7 +974,7 @@ font-size:12px;color:#666}}
 <button data-f="SKIP">只看 {ST_LABEL['SKIP']}</button>
 <span class="hint">点按钮筛选表格行</span>
 </div>
-<table><thead><tr><th>结果</th><th>编号</th><th>项目</th><th>详情</th><th>来源</th></tr></thead>
+<table><thead><tr><th>序号</th><th>结果</th><th>项目</th><th>详情</th><th>来源</th></tr></thead>
 <tbody>{rows}</tbody></table>
 <script>
 var bs=[].slice.call(document.querySelectorAll('.bar button'));

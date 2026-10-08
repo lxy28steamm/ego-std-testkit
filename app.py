@@ -38,8 +38,14 @@ PYEXE = sys.executable
 DEVICE_FILE = BASE / "device_ip.txt"
 EXPORT_DIR = BASE / "out"          # 与 ego_api_test.py 的报告目录保持一致
 
-# 结果行形如：  [+] E-D-004      采集控制台        PASS  state=healthy
+# 结果行形如：  [+]   3. 采集控制台        PASS  state=healthy
+# 第 2 段是执行顺序序号（1..N），和报告/JSON 里是同一个号
 RESULT_RE = re.compile(
+    r"^\s*\[([+x!\-])\]\s+(\d+)\.\s+(.*?)\s+(PASS|FAIL|WARN|SKIP)\b\s*(.*)$"
+)
+# 旧格式（编号改造前的 `[+] E-D-003 采集控制台 PASS ...`）留作兜底：
+# 万一调的是别的 checkout 里的老引擎，也不至于整张表解析不出来。
+RESULT_RE_LEGACY = re.compile(
     r"^\s*\[([+x!\-])\]\s+(\S+)\s+(.*?)\s+(PASS|FAIL|WARN|SKIP)\b\s*(.*)$"
 )
 FLAG2STATUS = {"+": "PASS", "x": "FAIL", "!": "WARN", "-": "SKIP"}
@@ -403,7 +409,7 @@ class CheckupPanel(Panel):
         root.addWidget(self.banner)
 
         self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["结果", "编号", "检查项", "详情"])
+        self.table.setHorizontalHeaderLabels(["结果", "序号", "检查项", "详情"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -412,7 +418,9 @@ class CheckupPanel(Panel):
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.Fixed)
         self.table.setColumnWidth(0, 74)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        # 序号列定宽即可，不然 ResizeToContents 会因为表头文字把它撑开
+        hh.setSectionResizeMode(1, QHeaderView.Fixed)
+        self.table.setColumnWidth(1, 48)
         hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(3, QHeaderView.Stretch)
         self.table.setMaximumHeight(0)  # 先藏着，有结果再展开
@@ -443,13 +451,15 @@ class CheckupPanel(Panel):
     def colorize(self, line: str) -> str:
         m = RESULT_RE.match(line)
         if not m:
+            m = RESULT_RE_LEGACY.match(line)
+        if not m:
             return line
-        flag, cid, name, status, detail = m.groups()
-        self._add_row(status, cid, name.strip(), detail.strip())
+        flag, no, name, status, detail = m.groups()
+        self._add_row(status, no, name.strip(), detail.strip())
         col = {"PASS": C_OK, "FAIL": C_BAD, "WARN": C_WARN, "SKIP": C_SKIP}[status]
-        return f"  [{flag}] {cid:<10} {name.strip():<14} {status:<4} {detail.strip()}"
+        return f"  [{flag}] {no:>5} {name.strip():<14} {status:<4} {detail.strip()}"
 
-    def _add_row(self, status: str, cid: str, name: str, detail: str) -> None:
+    def _add_row(self, status: str, no: str, name: str, detail: str) -> None:
         bg = {"PASS": BG_OK, "FAIL": BG_BAD, "WARN": BG_WARN, "SKIP": BG_SKIP}[status]
         col = {"PASS": C_OK, "FAIL": C_BAD, "WARN": C_WARN, "SKIP": C_SKIP}[status]
         r = self.table.rowCount()
@@ -462,7 +472,10 @@ class CheckupPanel(Panel):
         f.setBold(True)
         st.setFont(f)
         st.setTextAlignment(Qt.AlignCenter)
-        cells = [st, QTableWidgetItem(cid), QTableWidgetItem(name), QTableWidgetItem(detail)]
+        # 「编号」列 = 执行顺序序号（1..N），和报告/JSON 同号，不再显示 E-D-003 那套
+        noit = QTableWidgetItem(str(no))
+        noit.setTextAlignment(Qt.AlignCenter)
+        cells = [st, noit, QTableWidgetItem(name), QTableWidgetItem(detail)]
         for c, it in enumerate(cells):
             it.setBackground(QColor(bg))
             if c in (1, 2, 3):

@@ -365,8 +365,10 @@ def export_html(recs: list[dict], path: str, s: dict) -> str:
         if not bad and not rec.get("error"):
             continue
         li = "".join(
-            f'<li><span class="tag {html.escape(i["status"])}">{i["status"]}</span>'
-            f'<code>{html.escape(i["id"])}</code> {html.escape(i["name"])}'
+            f'<li><span class="no">#{i.get("no", "?")}</span>'
+            f'<span class="tag {html.escape(i["status"])}">{i["status"]}</span>'
+            f'{html.escape(i["name"])}'
+            f'<span class="cid">{html.escape(i["id"])}</span>'
             f'<span class="d">{html.escape(str(i["detail"])[:200])}</span></li>'
             for i in bad)
         if rec.get("error"):
@@ -407,6 +409,10 @@ def export_html(recs: list[dict], path: str, s: dict) -> str:
  tr.ok   .vd{{color:#15803d}}
  tr.warn .vd{{color:#b45309}}
  tr.bad  .vd{{color:#b91c1c}}
+ /* 明细行：序号是主引用，原用例号退成灰色小字 */
+ .no{{display:inline-block;min-width:34px;font-weight:700;color:#374151;margin-right:4px}}
+ .cid{{color:#b3afa6;font-size:11px;font-family:ui-monospace,Consolas,monospace;
+   margin-left:6px}}
  .legend{{margin:0 0 14px;font-size:12px;color:#6b7280}}
  .legend b{{color:#374151}}
  .legend span{{display:inline-block;margin-right:12px;font-weight:600}}
@@ -448,11 +454,12 @@ def export_csv(recs: list[dict], path: str) -> str:
         for r in recs:
             w.writerow([_cell(r, k) for k, _, _ in COLS])
         w.writerow([])
-        w.writerow(["明细", "状态", "ID", "检查项", "详情"])
+        w.writerow(["明细", "序号", "状态", "检查项", "详情", "原用例号"])
         for r in recs:
             for i in r.get("items", []):
                 if i.get("status") in ("FAIL", "WARN"):
-                    w.writerow([r["ip"], i["status"], i["id"], i["name"], i["detail"]])
+                    w.writerow([r["ip"], i.get("no", ""), i["status"], i["name"],
+                                i["detail"], i["id"]])
     return path
 
 
@@ -506,22 +513,23 @@ def export_xlsx(recs: list[dict], path: str, s: dict) -> str:
     ws.freeze_panes = "A6"
 
     ws2 = wb.create_sheet("失败明细")
-    ws2.append(["IP", "状态", "ID", "检查项", "详情", "来源接口"])
-    for c in range(1, 7):
+    ws2.append(["IP", "序号", "状态", "检查项", "详情", "来源接口", "原用例号"])
+    for c in range(1, 8):
         ws2.cell(row=1, column=c).fill = head_fill
         ws2.cell(row=1, column=c).font = head_font
     for r in recs:
         for i in r.get("items", []):
             if i.get("status") in ("FAIL", "WARN"):
-                ws2.append([r["ip"], ST_LABEL_EN.get(i["status"], i["status"]),
-                            i["id"], i["name"],
-                            str(i["detail"])[:500], i.get("src", "")])
-                st_cell = ws2.cell(row=ws2.max_row, column=2)
+                ws2.append([r["ip"], i.get("no", ""),
+                            ST_LABEL_EN.get(i["status"], i["status"]),
+                            i["name"], str(i["detail"])[:500],
+                            i.get("src", ""), i["id"]])
+                st_cell = ws2.cell(row=ws2.max_row, column=3)
                 if i["status"] in vfill:
                     st_cell.fill = vfill[i["status"]]
                     st_cell.font = vfont[i["status"]]
                 st_cell.alignment = Alignment(horizontal="center")
-    for i, w in enumerate([16, 8, 12, 16, 90, 34], start=1):
+    for i, w in enumerate([16, 7, 10, 18, 90, 34, 14], start=1):
         ws2.column_dimensions[get_column_letter(i)].width = w
     ws2.freeze_panes = "A2"
 
@@ -558,7 +566,9 @@ def _print_table(recs: list[dict], s: dict) -> None:
     for r in recs:
         note = r.get("error") or ""
         if not note:
-            bad = [f"{i['id']}" for i in r.get("items", []) if i.get("status") == "FAIL"]
+            # 备注里给序号不给 ID —— 现场就是拿这个号去报告里对行
+            bad = [f"#{i.get('no', '?')}" for i in r.get("items", [])
+                   if i.get("status") == "FAIL"]
             note = ("失败:" + ",".join(bad[:4])) if bad else ""
         print(f"{_pad(r['ip'], 17)}{_pad(str(r.get('sn', '')), 21)}"
               f"{_pad(str(r.get('version', '')), 9)}"
