@@ -50,6 +50,12 @@ RESULT_RE_LEGACY = re.compile(
 )
 FLAG2STATUS = {"+": "PASS", "x": "FAIL", "!": "WARN", "-": "SKIP"}
 
+# 结尾两行设备身份（ego_api_test.py 的 identity_lines() 打的），GUI 顺手抓下来放进
+# 结论横幅：跑完一眼看到「这是哪台、什么版本、平台 ID」，不用再翻日志或报告。
+# 列之间是 ≥2 个空格，所以用 \s{2,} 切，别用单个空格（值本身可能含空格）。
+IDENT_RE = re.compile(r"^设备SN\s+(.+?)\s{2,}软件版本\s+(\S+)\s*$")
+IDENT2_RE = re.compile(r"^平台ID\s+(.+?)\s{2,}相机SN\s+(\S+)\s*$")
+
 C_OK, C_BAD, C_WARN, C_SKIP = "#1a7f37", "#c62828", "#b26a00", "#6b7280"
 BG_OK, BG_BAD, BG_WARN, BG_SKIP = "#e8f5e9", "#fdecea", "#fff5e5", "#f2f3f5"
 
@@ -471,6 +477,7 @@ class CheckupPanel(Panel):
     def build_args(self) -> list[str]:
         self.reset_table()
         self._tally = {"PASS": 0, "FAIL": 0, "WARN": 0, "SKIP": 0}
+        self._ident = {}
         args = ["ego_api_test.py", "--no-manual"]
         host = WINDOW.device_ip()
         if host:
@@ -486,6 +493,15 @@ class CheckupPanel(Panel):
         return args
 
     def colorize(self, line: str) -> str:
+        # 先认设备身份那两行（不是检查项，不进表格，只留给结论横幅用）
+        mi = IDENT_RE.match(line)
+        if mi:
+            self._ident["sn"], self._ident["version"] = mi.group(1), mi.group(2)
+            return line
+        mi2 = IDENT2_RE.match(line)
+        if mi2:
+            self._ident["ldp"], self._ident["camera"] = mi2.group(1), mi2.group(2)
+            return line
         m = RESULT_RE.match(line)
         if not m:
             m = RESULT_RE_LEGACY.match(line)
@@ -530,12 +546,21 @@ class CheckupPanel(Panel):
         total = sum(t.values())
         if total == 0:
             return
+        # 交付对方最先问的就是 SN 和版本 —— 直接顶在结论里，不用再往下翻
+        d = getattr(self, "_ident", {})
+        ident = ""
+        if d.get("sn") or d.get("version"):
+            bits = [f"设备SN {d.get('sn', '未取到')}",
+                    f"软件版本 {d.get('version', '未取到')}"]
+            if d.get("ldp"):
+                bits.append(f"平台ID {d['ldp']}")
+            ident = "\n" + " · ".join(bits)
         if t["FAIL"] == 0:
             self._banner(f"✔ 通过　共 {total} 项：{t['PASS']} 通过 / {t['WARN']} 警告 / "
-                         f"{t['SKIP']} 跳过　—— 这台可以交付", "#e8f5e9", "#1a7f37")
+                         f"{t['SKIP']} 跳过　—— 这台可以交付{ident}", "#e8f5e9", "#1a7f37")
         else:
             self._banner(f"✘ 未通过　共 {total} 项：{t['FAIL']} 失败 / {t['PASS']} 通过 / "
-                         f"{t['WARN']} 警告　—— 先处理失败项再交", "#fdecea", "#c62828")
+                         f"{t['WARN']} 警告　—— 先处理失败项再交{ident}", "#fdecea", "#c62828")
 
     def _banner(self, text: str, bg: str, fg: str) -> None:
         self.banner.setText(text)

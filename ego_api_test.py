@@ -231,6 +231,36 @@ def summarize(r) -> dict:
     return s
 
 
+def identity_lines(r) -> list[str]:
+    """控制台结尾要带的「这是哪台、什么版本」两行。
+
+    现场对接/交付时对方第一句就是「设备 SN 多少、软件什么版本」——原来这两项
+    只写在 HTML 报告头里，跑完控制台看不到，得再翻报告。这里直接并进结尾清单。
+    取值全部复用 meta（auto_checks 里从 /api/v2/health 与 /openapi.json 收的），
+    设备不可达时 meta 里是空串，就显示「未取到」，不编造。
+    """
+    m = r.meta or {}
+
+    def pick(*keys) -> str:
+        for k in keys:
+            v = str(m.get(k) or "").strip()
+            if v:
+                return v
+        return "未取到"
+
+    sn = pick("sn", "serial")          # 整机 SN（pi-<hostname>）；取不到退短写法
+    ver = pick("version")              # 软件版本，来自 /openapi.json 的 info.version
+    ldp = pick("ldp_id")               # 平台侧设备 ID，交付单上用这个
+    cam = str(m.get("camera_sn") or "").strip()    # 相机芯片 SN（返修要）
+    model = str(m.get("model") or "").strip()      # 用户口径 233/235，没给 --model 时为空
+    cam_txt = (f"{model} · {cam}" if model and cam else (cam or model)) or "未取到"
+
+    # 标签按「显示宽度」对齐：设备SN/平台ID 都是 6 列，软件版本/相机SN 补到 10 列，
+    # 这样两行的两个值都从同一列起，扫一眼不会串行。
+    return [f"设备SN  {sn:<26} 软件版本  {ver}",
+            f"平台ID  {ldp:<26} 相机SN    {cam_txt}"]
+
+
 def print_grouped_summary(r, s: dict, show_pass: bool = False) -> None:
     """巡检结尾在控制台重列一遍「分组清单」：失败 → 告警 → 通过。
 
@@ -238,11 +268,17 @@ def print_grouped_summary(r, s: dict, show_pass: bool = False) -> None:
     得一行行翻。这里把需要关注的挑出来重列（失败在前、告警在后），
     通过项默认只给计数（`--show-pass` 才展开）—— 控制台不变长，问题一眼可见。
 
+    抬头先顶两行设备身份（SN / 版本 / 平台ID / 相机）：交付时最先被问的就是这个。
+
     实时流水（R.add 逐条打印）保持原样不动：GUI 和 batch_check 都按行解析它。
+    这里新增的行不是 `[+] 12. 名称 PASS` 形态，GUI 的 RESULT_RE 不会误抓成检查项。
     """
     bar = "─" * 88
     n_bad, n_warn, n_pass = s["FAIL"], s["WARN"], s["PASS"]
     print()
+    print(bar)
+    for _ln in identity_lines(r):
+        print(_ln)
     print(bar)
     head = f"需要关注 {n_bad + n_warn} 项"
     if n_bad:
