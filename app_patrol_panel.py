@@ -12,7 +12,7 @@ from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QLineEdit, QPushButton, QComboBox, QCheckBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QPlainTextEdit, QProgressBar, QFileDialog, QMessageBox,
-    QDialog, QFormLayout, QDialogButtonBox, QSpinBox)
+    QDialog, QFormLayout, QDialogButtonBox, QSpinBox, QScrollArea, QFrame, QLayout)
 
 from app_patrol_engine import BASE, RUNS, PREFIX, manual_session, write_session
 
@@ -44,8 +44,20 @@ class AppPatrolPanel(QWidget):
         self.discovery = QProcess(self)
         self.discovery.finished.connect(self._devices_ready)
         self.discovery.errorOccurred.connect(self._discovery_error)
-        root = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        content = QWidget()
+        root = QVBoxLayout(content)
+        # Preserve control minimum sizes at small window heights. The viewport
+        # scrolls instead of forcing nested grid rows to overlap their widgets.
+        root.setSizeConstraint(QLayout.SetMinimumSize)
         root.setContentsMargins(18, 16, 18, 14)
+        root.setSpacing(10)
+        self.scroll.setWidget(content)
+        outer.addWidget(self.scroll)
         title = QLabel('APP 巡检')
         title.setStyleSheet('font-size:17px;font-weight:600;color:#14181f')
         root.addWidget(title)
@@ -53,6 +65,9 @@ class AppPatrolPanel(QWidget):
         desc.setWordWrap(True)
         root.addWidget(desc)
         grid = QGridLayout()
+        grid.setVerticalSpacing(8)
+        grid.setHorizontalSpacing(10)
+        grid.setColumnStretch(1, 1)
         self.framework = QLineEdit(str(default_framework()))
         browse = QPushButton('选择框架')
         self.browse = browse

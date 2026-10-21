@@ -49,6 +49,24 @@ class PatrolTests(unittest.TestCase):
         self.assertTrue(window.nav.item(8).isHidden())
         window.close()
 
+    def test_patrol_controls_do_not_overlap_in_small_workbench(self):
+        import app as workstation
+        window = workstation.MainWindow()
+        window.nav.setCurrentRow(7)
+        panel = window.app_patrol
+        window.show()
+        for width,height in ((1040,700),(1180,760)):
+            window.resize(width,height)
+            for mode in ('selfcheck','flow_full','flow_upload'):
+                panel.mode.setCurrentIndex(panel.mode.findData(mode))
+                self.app.processEvents()
+                controls = (panel.framework,panel.devices,panel.mode)
+                for current,following in zip(controls,controls[1:]):
+                    self.assertGreater(following.y(),current.y()+current.height())
+                    self.assertGreaterEqual(current.height(),current.minimumSizeHint().height())
+                self.assertGreaterEqual(panel.scroll.widget().height(), panel.scroll.widget().minimumSizeHint().height())
+        window.close()
+
     def test_history_is_read_only_and_manual_edits_persist(self):
         panel = AppPatrolPanel()
         with tempfile.TemporaryDirectory() as tmp, patch.object(engine, 'RUNS', Path(tmp)):
