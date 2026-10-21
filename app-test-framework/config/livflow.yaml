@@ -1,0 +1,10 @@
+server_url: http://127.0.0.1:4723
+wait_seconds: 20
+capabilities:
+  platformName: Android
+  appium:automationName: UiAutomator2
+  appium:deviceName: Android
+  appium:appPackage: com.livsyn.livsyn_collection_app
+  appium:appActivity: .MainActivity
+  appium:noReset: true
+  appium:newCommandTimeout: 120

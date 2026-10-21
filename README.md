@@ -436,3 +436,18 @@ python push_github.py --repo 别的名字 --public   # 换仓库名 / 建公开�
 ```
 
 推送完成后，建议到 <https://github.com/settings/tokens> 把那个 Token 删掉——删掉不影响仓库和代码。
+## APP 巡检
+
+左侧新增“APP 巡检”：选择 Android 手机、执行基础自动检查、建立 65 项人工协同清单、查看历史结果及本轮报告。
+
+也可双击“启动APP巡检.bat”直接进入该页。使用说明见 [APP巡检](docs/APP巡检.md)。包含全量自动巡检按钮、逐项结果、问题优先的HTML报告和截图证据；完整清单不会继承历史通过结果。
+
+仓库内的 `app-test-framework/` 包含可独立安装的框架源码。先按原步骤安装工作台环境，再在项目目录运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install-app-tests.ps1
+```
+
+安装器创建框架专用环境并运行10项离线检查，不操作手机。工作台优先选择已安装的仓库内框架；本机已有 `D:\app-test-framework` 时仍可兼容使用，也可在界面手动选择路径。设备检查还需要Android SDK的ADB和USB调试授权；ADB流程不需要Appium服务器，使用通用Appium用例时才需额外部署服务器。
+
+虚拟环境、报告、MCAP、APK、视频、本机配置和账号凭据不入库。首次使用请在“流程配置”填写自己的任务和设备信息，账号密码仅在手机输入。新电脑不会包含本机历史结果。全量自动范围为3项框架检查和9项设备流程，未勾选的实际操作记为未测；65项人工清单另行记录。

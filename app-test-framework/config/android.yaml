@@ -1,0 +1,11 @@
+server_url: http://127.0.0.1:4723
+wait_seconds: 15
+capabilities:
+  platformName: Android
+  appium:automationName: UiAutomator2
+  appium:deviceName: Android
+  # Set ANDROID_UDID to the exact serial shown by adb devices.
+  appium:appPackage: com.android.settings
+  appium:appActivity: .Settings
+  appium:noReset: true
+  appium:newCommandTimeout: 120

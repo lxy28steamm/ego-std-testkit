@@ -43,3 +43,10 @@ desktop.ini
 *.bak
 *.tmp
 ~*
+
+# APP test secrets, local fixtures and captured device data
+**/.env
+**/.env.*
+**/config/local.yaml
+*.apk
+*.mp4

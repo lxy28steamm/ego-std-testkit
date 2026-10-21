@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Ego-Std 交付测试台（桌面版）
+"""Ego-Std 测试工作台（桌面版）
 
 把 ego-std-test 目录下的一堆命令行脚本，包成一个大窗口：
     左边选功能 → 右边填参数 → 点开始 → 实时输出 + 红绿灯结论。
@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 BASE = Path(__file__).resolve().parent
+from app_patrol_panel import AppPatrolPanel
 PYEXE = sys.executable
 DEVICE_FILE = BASE / "device_ip.txt"
 EXPORT_DIR = BASE / "out"          # 与 ego_api_test.py 的报告目录保持一致
@@ -53,7 +54,7 @@ FLAG2STATUS = {"+": "PASS", "x": "FAIL", "!": "WARN", "-": "SKIP"}
 # 结尾两行设备身份（ego_api_test.py 的 identity_lines() 打的），GUI 顺手抓下来放进
 # 结论横幅：跑完一眼看到「这是哪台、什么版本、平台 ID」，不用再翻日志或报告。
 # 列之间是 ≥2 个空格，所以用 \s{2,} 切，别用单个空格（值本身可能含空格）。
-IDENT_RE = re.compile(r"^设备SN\s+(.+?)\s{2,}软件版本\s+(\S+)\s*$")
+IDENT_RE = re.compile(r"^设备SN\s+(.+?)\s{2,}软件版本\s+(.+?)\s*$")
 IDENT2_RE = re.compile(r"^平台ID\s+(.+?)\s{2,}相机SN\s+(\S+)\s*$")
 
 C_OK, C_BAD, C_WARN, C_SKIP = "#1a7f37", "#c62828", "#b26a00", "#6b7280"
@@ -266,15 +267,6 @@ class Panel(QWidget):
         btn_row.addWidget(self.btn_clear)
         btn_row.addStretch(1)
 
-        self.chk_shutdown = QCheckBox("跑完关机")
-        self.chk_shutdown.setToolTip(
-            "勾选后，本任务结束时自动关机（倒计时 60 秒，期间可用 shutdown /a 取消）\n"
-            "适合挂长任务：晚上跑完采样自动断电。"
-        )
-        self.chk_shutdown.setStyleSheet("color:#c62828;font-size:12px")
-        self.chk_shutdown.stateChanged.connect(self._on_shutdown_toggle)
-        btn_row.addWidget(self.chk_shutdown)
-
         root.addLayout(btn_row)
 
         self.build_middle(root)
@@ -306,43 +298,11 @@ class Panel(QWidget):
         """给子进程注入的额外环境变量（如云账号密码）。默认无。"""
         return {}
 
-    def _on_shutdown_toggle(self, _state) -> None:
-        # 直接读控件状态，避免 Qt5/Qt6 里 stateChanged 参数类型差异
-        if self.chk_shutdown.isChecked():
-            yes = QMessageBox.question(
-                self, "确认开启自动关机",
-                "任务结束后将自动关机（倒计时 60 秒）。\n\n"
-                "⚠ 执行前请确认设备侧的数据已经写完——\n"
-                "先停采集、等落盘，关机命令管不到设备本身。\n\n"
-                "确认开启？",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            )
-            if yes != QMessageBox.Yes:
-                self.chk_shutdown.setChecked(False)
-
-    def _do_shutdown(self) -> None:
-        import subprocess
-        try:
-            subprocess.Popen(["shutdown", "/s", "/t", "60"])
-            QMessageBox.information(
-                self, "自动关机已排定",
-                "任务已结束，电脑将在 60 秒后关机。\n\n"
-                "要取消：在开始菜单「运行」里执行  shutdown /a\n"
-                "（或在本机任意终端执行同样命令）"
-            )
-        except Exception as e:  # noqa: BLE001
-            QMessageBox.warning(self, "自动关机失败", f"无法排定关机：{e}")
-
     def on_finished(self, code: int) -> None:
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
         color = "#1a7f37" if code == 0 else "#c62828"
         self.append(f"<b style='color:{color}'>—— 结束（退出码 {code}）——</b>")
-        if self.chk_shutdown.isChecked():
-            self.chk_shutdown.setChecked(False)   # 防重复触发
-            self.out.appendHtml(
-                "<b style='color:#c62828'>［自动关机］60 秒后关机，shutdown /a 可取消</b>")
-            self._do_shutdown()
 
     def on_run(self) -> None:
         args = self.build_args()
@@ -372,9 +332,9 @@ class Panel(QWidget):
 # ================================================================== 各功能面板
 
 class CheckupPanel(Panel):
-    title = "① 一键体检"
+    title = "设备检查"
     desc = ("对整机做一轮自动巡检：设备在线、相机/存储/网络/登录、IMU 配置与传感器、"
-            "采集启停。跑完直接给「能不能交」的结论。")
+            "可选的采集启停测试。结果仅覆盖本次已执行项目，告警和跳过项需复核。")
 
     def build_controls(self) -> None:
         g = self.ctrl_layout
@@ -386,7 +346,7 @@ class CheckupPanel(Panel):
         self.model.addItem("不指定（按当前槽位）", "")
         self.model.addItem("233（ego-std）", "233")
         self.model.addItem("235（ego-std235）", "235")
-        self.model.setCurrentIndex(2)
+        self.model.setCurrentIndex(0)
         self.model.setFixedWidth(190)
         self.model.setToolTip(
             "会先把设备切到对应相机槽位再自检：\n"
@@ -427,6 +387,13 @@ class CheckupPanel(Panel):
             f"将切到设备槽位 {slot} 后自检" if slot else "不切槽位，按设备当前生效相机检查")
 
     def build_middle(self, root) -> None:
+        self.identity = QLabel("本轮设备信息：等待测试")
+        self.identity.setTextFormat(Qt.PlainText)
+        self.identity.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.identity.setWordWrap(True)
+        self.identity.setStyleSheet(
+            "background:#f6f7f9;color:#1f2530;border-radius:6px;padding:10px;font-size:13px")
+        root.addWidget(self.identity)
         self.banner = QLabel("")
         self.banner.setVisible(False)
         self.banner.setWordWrap(True)
@@ -478,6 +445,7 @@ class CheckupPanel(Panel):
         self.reset_table()
         self._tally = {"PASS": 0, "FAIL": 0, "WARN": 0, "SKIP": 0}
         self._ident = {}
+        self.identity.setText("本轮设备信息：正在读取…")
         args = ["ego_api_test.py", "--no-manual"]
         host = WINDOW.device_ip()
         if host:
@@ -544,23 +512,27 @@ class CheckupPanel(Panel):
         self._fit_height()
         t = self._tally
         total = sum(t.values())
-        if total == 0:
-            return
-        # 交付对方最先问的就是 SN 和版本 —— 直接顶在结论里，不用再往下翻
         d = getattr(self, "_ident", {})
+        bits = [f"设备 SN：{d.get('sn') or '未获取'}",
+                f"软件版本：{d.get('version') or '未获取'}"]
+        if d.get("ldp"):
+            bits.append(f"平台 ID：{d['ldp']}")
+        self.identity.setText("本轮测试设备　" + "　 | 　".join(bits))
+        self.append("本轮测试设备：" + "；".join(bits))
         ident = ""
-        if d.get("sn") or d.get("version"):
-            bits = [f"设备SN {d.get('sn', '未取到')}",
-                    f"软件版本 {d.get('version', '未取到')}"]
-            if d.get("ldp"):
-                bits.append(f"平台ID {d['ldp']}")
-            ident = "\n" + " · ".join(bits)
-        if t["FAIL"] == 0:
-            self._banner(f"✔ 通过　共 {total} 项：{t['PASS']} 通过 / {t['WARN']} 警告 / "
-                         f"{t['SKIP']} 跳过　—— 这台可以交付{ident}", "#e8f5e9", "#1a7f37")
+        if total == 0:
+            self._banner("未取得检查结果，请查看运行日志。", BG_WARN, C_WARN)
+            return
+        summary = (f"共 {total} 项：{t['PASS']} 通过 / {t['FAIL']} 失败 / "
+                   f"{t['WARN']} 告警 / {t['SKIP']} 跳过")
+        if code != 0:
+            self._banner(f"! 检查异常结束，请查看日志　{summary}{ident}", BG_BAD, C_BAD)
+        elif t["FAIL"]:
+            self._banner(f"✘ 存在未通过项　{summary}{ident}", BG_BAD, C_BAD)
+        elif t["WARN"] or t["SKIP"]:
+            self._banner(f"! 检查完成，存在待复核项　{summary}{ident}", BG_WARN, C_WARN)
         else:
-            self._banner(f"✘ 未通过　共 {total} 项：{t['FAIL']} 失败 / {t['PASS']} 通过 / "
-                         f"{t['WARN']} 警告　—— 先处理失败项再交{ident}", "#fdecea", "#c62828")
+            self._banner(f"✔ 本次检查通过　{summary}{ident}", BG_OK, C_OK)
 
     def _banner(self, text: str, bg: str, fg: str) -> None:
         self.banner.setText(text)
@@ -600,9 +572,9 @@ class BatchWorker(QObject):
 
 
 class BatchPanel(Panel):
-    title = "③ 批量巡检"
-    desc = ("一次给一整批设备（17 台 / 整间实验室）跑同一套体检，并发执行，"
-            "结束后出一张总表：谁的版本落后、谁没接相机、谁不合格，一眼挑完。")
+    title = "批量检查"
+    desc = ("对多台设备执行相同检查，支持并发运行。"
+            "完成后查看汇总、定位问题并导出报告。")
 
     def build_controls(self) -> None:
         g = self.ctrl_layout
@@ -624,7 +596,7 @@ class BatchPanel(Panel):
         self.model.addItem("不指定", "")
         self.model.addItem("233（ego-std）", "233")
         self.model.addItem("235（ego-std235）", "235")
-        self.model.setCurrentIndex(2)
+        self.model.setCurrentIndex(0)
         self.model.setFixedWidth(170)
         self.model.setToolTip("每台都会先切到对应相机槽位再自检：\n"
                               "233 → ego-lite-01，235 → ego-std-235")
@@ -654,7 +626,7 @@ class BatchPanel(Panel):
         self.do_collect = QCheckBox("实测一轮采集（会往设备写文件，约 30 秒/台）")
         g.addWidget(self.do_collect, 3, 0, 1, 2)
 
-        self.chk_fail_only = QCheckBox("只导出不合格设备明细")
+        self.chk_fail_only = QCheckBox("仅导出未通过设备明细")
         self.chk_fail_only.setToolTip("交付场景常用：只列需要跟进的机器。")
         g.addWidget(self.chk_fail_only, 3, 2)
 
@@ -718,9 +690,9 @@ class BatchPanel(Panel):
         root.addWidget(self.prog_text)
 
         # --- 结果表 ---
-        self.table = QTableWidget(0, 9)
+        self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels(
-            ["IP", "结论", "版本", "状态", "相机",
+            ["IP", "结论", "设备 SN", "软件版本", "状态", "相机",
              "✔通过", "✘失败", "!告警", "耗时"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -729,7 +701,7 @@ class BatchPanel(Panel):
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.Fixed)
         self.table.setColumnWidth(0, 128)
-        for c in (1, 2, 3, 4, 5, 6, 7, 8):
+        for c in range(1, 10):
             hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
         self.table.setMaximumHeight(0)
         root.addWidget(self.table)
@@ -762,7 +734,7 @@ class BatchPanel(Panel):
         self._worker: BatchWorker | None = None
 
         # 启动即扫一次，省得每次都点
-        QTimer.singleShot(200, self.scan_devices)
+        # 用户主动扫描，避免打开工作台即探测网络。
 
     # --- 参数区联动 -------------------------------------------------
     PLACEHOLDERS = {
@@ -955,22 +927,31 @@ class BatchPanel(Panel):
 
         s = self._summary
         self.prog_text.setText(
-            f"完成 {s['total']} 台：合格 {s['PASS']} / 告警 {s['WARN']} / 不合格 {s['FAIL']}")
+            f"完成 {s['total']} 台：通过 {s['PASS']} / 告警 {s['WARN']} / 未通过 {s['FAIL']}")
 
-        if s["FAIL"] == 0 and s["WARN"] == 0:
-            self._banner(f"✔ 全部通过　{s['total']} 台 18 项全绿 —— 可以整批交付",
+        skipped = sum(r.get("SKIP", 0) for r in recs)
+        if not recs:
+            self._banner("未取得设备检查结果，请查看运行日志。", BG_WARN, C_WARN)
+        elif not s["FAIL"] and skipped:
+            self._banner(f"! 检查完成，存在 {skipped} 个跳过项，请结合告警复核报告。", BG_WARN, C_WARN)
+        elif s["FAIL"] == 0 and s["WARN"] == 0:
+            self._banner(f"✔ 全部通过　{s['total']} 台检查通过，请结合报告确认检查范围",
                          BG_OK, C_OK)
         elif s["FAIL"] == 0:
-            self._banner(f"✔ 无不合格　{s['total']} 台中 {s['PASS']} 台通过、"
-                         f"{s['WARN']} 台有告警（不阻断交付）", BG_WARN, C_WARN)
+            self._banner(f"! 存在待复核项　{s['total']} 台中 {s['PASS']} 台通过、"
+                         f"{s['WARN']} 台有告警，请复核后判断", BG_WARN, C_WARN)
         else:
-            self._banner(f"✘ {s['FAIL']} 台不合格　（共 {s['total']} 台）"
-                         f"　—— 点下面表格里的行看失败项，再导出明细发给开发",
+            self._banner(f"✘ {s['FAIL']} 台未通过　（共 {s['total']} 台）"
+                         f"　—— 选择设备查看失败项，可导出明细",
                          BG_BAD, C_BAD)
 
         color = C_BAD if s["FAIL"] else C_OK
         self.append(f"\n<b style='color:{color}'>—— 批量巡检结束："
-                    f"合格 {s['PASS']} / 告警 {s['WARN']} / 不合格 {s['FAIL']} ——</b>")
+                    f"通过 {s['PASS']} / 告警 {s['WARN']} / 未通过 {s['FAIL']} ——</b>")
+        for rec in recs:
+            self.append(escape(
+                f"本轮测试设备：IP {rec['ip']}；设备 SN：{rec.get('sn') or rec.get('serial') or '未获取'}；"
+                f"软件版本：{rec.get('version') or '未获取'}"))
         if s["FAIL"]:
             self.append("下一步：点「导出 Excel」拿到失败明细，按 IP 对号入座。")
         else:
@@ -980,9 +961,6 @@ class BatchPanel(Panel):
             self._thread.quit()
             self._thread.wait(5000)
         self._restore()
-        if self.chk_shutdown.isChecked():
-            self.chk_shutdown.setChecked(False)
-            self._do_shutdown()
 
     def _on_failed(self, msg: str) -> None:
         self.append(f"<b style='color:#c62828'>[批量巡检异常] {msg}</b>")
@@ -1001,7 +979,8 @@ class BatchPanel(Panel):
                 rec["ip"],
                 # 结论列带上符号，别只靠底色 —— 截图/黑白打印时底色会丢
                 ST_LABEL_EN.get(verdict, verdict),
-                rec.get("version") or "-",
+                rec.get("sn") or rec.get("serial") or "未获取",
+                rec.get("version") or "未获取",
                 str(rec.get("state") or "-")[:12],
                 str(rec.get("cameras", "")),
                 rec["PASS"], rec["FAIL"], rec["WARN"],
@@ -1011,7 +990,7 @@ class BatchPanel(Panel):
                 it = QTableWidgetItem(str(v))
                 it.setBackground(QColor(bg))
                 it.setForeground(QColor(fg if c in (0, 1) else "#1f2530"))
-                if c in (0, 1, 5, 6, 7, 8):
+                if c in (0, 1, 6, 7, 8, 9):
                     it.setTextAlignment(Qt.AlignCenter)
                 f = it.font()
                 if c == 1:
@@ -1068,7 +1047,7 @@ class BatchPanel(Panel):
 
 
 class FindPanel(Panel):
-    title = "④ 设备发现"
+    title = "设备发现"
     desc = "不知道设备 IP 时用这个。扫描本机所在网段，只有能拉通 API 的才算设备。"
 
     def build_controls(self) -> None:
@@ -1102,8 +1081,8 @@ class FindPanel(Panel):
 
 
 class WatchPanel(Panel):
-    title = "⑤ IMU 队列监控"
-    desc = "实时盯录制队列水位与各数据流频率。掉线前水位会先冲高，这里是抓现行的地方。"
+    title = "IMU 监控"
+    desc = "查看录制队列水位和数据流频率，辅助排查采集异常。"
 
     def build_controls(self) -> None:
         g = self.ctrl_layout
@@ -1112,7 +1091,7 @@ class WatchPanel(Panel):
         self.secs.setRange(0, 3600)
         self.secs.setValue(60)
         self.secs.setDecimals(0)
-        self.secs.setSpecialValueText("一直盯")
+        self.secs.setSpecialValueText("持续监测")
         g.addWidget(self.secs, 0, 1)
 
         g.addWidget(QLabel("采样间隔（秒）"), 0, 2)
@@ -1133,7 +1112,7 @@ class WatchPanel(Panel):
 
 
 class CollectPanel(Panel):
-    title = "② 一键采传"
+    title = "采集与上传"
     desc = ("选任务 → 采集 → 验盘 → 上传云端 → 校验，一条命令跑完。"
             "对应设备 /remote 页面上人工点的那套动作。"
             "⚠ 上传默认会删设备上的本地 mcap（避免同目录反复重传），要留底先在设备侧拷走。")
@@ -1162,8 +1141,8 @@ class CollectPanel(Panel):
 
         self.chk_keep = QCheckBox("上传后保留设备上的本地 mcap")
         self.chk_keep.setToolTip(
-            "默认不勾。保留会让同目录文件越堆越多，下次上传把历史文件全部重传一遍。\n"
-            "确实要留底才勾，并且知道代价。"
+            "默认不保留。勾选后文件将继续占用设备存储空间。\n"
+            "后续上传可能包含同目录的历史文件，请按需备份。"
         )
         g.addWidget(self.chk_keep, 2, 0, 1, 2)
 
@@ -1329,9 +1308,9 @@ class CollectPanel(Panel):
 
 
 class SerialPanel(Panel):
-    title = "⑥ 串口探测"
+    title = "串口诊断"
     desc = ("直接读头环 IMU 串口，统计真实字节率与帧率。用来判断设备实际输出频率是不是"
-            "远超配置值（这是采集掉线的根源之一）。")
+            "偏离配置值，辅助分析采集异常。")
 
     def build_controls(self) -> None:
         g = self.ctrl_layout
@@ -1356,8 +1335,8 @@ class SerialPanel(Panel):
 
 
 class BatteryPanel(Panel):
-    title = "⑦ 电池采样"
-    desc = ("连续采样电池电压/电流/电量，结束时判定充不满的根因"
+    title = "电池监测"
+    desc = ("连续采样电池电压/电流/电量，提供充电状态的排查线索"
             "（电量计未校准 / 充不进去 / 净放电）。")
 
     def build_controls(self) -> None:
@@ -1366,7 +1345,7 @@ class BatteryPanel(Panel):
         self.mins = QDoubleSpinBox()
         self.mins.setRange(0, 1440)
         self.mins.setValue(60)
-        self.mins.setSpecialValueText("一直跑")
+        self.mins.setSpecialValueText("持续监测")
         g.addWidget(self.mins, 0, 1)
 
         g.addWidget(QLabel("采样间隔（秒）"), 0, 2)
@@ -1393,7 +1372,7 @@ class BatteryPanel(Panel):
 
 
 class SrcPanel(Panel):
-    title = "⑧ 源码查看"
+    title = "源码查看"
     desc = ("不装 docker、不要 sudo，直接读设备上正在跑的容器源码。"
             "升级前后对比关键代码，可当验收依据。")
 
@@ -1447,11 +1426,11 @@ class SrcPanel(Panel):
 
 
 class LogPanel(Panel):
-    title = "⑨ 运行日志"
+    title = "运行日志"
     desc = "探测设备上日志都放在哪（systemd / 应用目录 / 容器 stdout），并列出最近内容。"
 
     def build_controls(self) -> None:
-        hint = QLabel("无参数，直接点开始。探测需要 SSH（ls / ls）。")
+        hint = QLabel("点击“开始”读取近期日志。需要设备 SSH 访问权限。")
         hint.setStyleSheet("color:#8b93a1;font-size:12px")
         self.ctrl_layout.addWidget(hint, 0, 0)
 
@@ -1472,7 +1451,7 @@ class CmdPanel(Panel):
       py   —— 用本机 python 跑（可以跟 .py 脚本名 + 参数）
     历史记录存在 QSettings 里，翻 up/down 能翻到上次敲的。
     """
-    title = "⑩ 命令台"
+    title = "命令调试"
     desc = ("临时敲命令排查用，不用为一次性动作再写脚本。"
             "api 模式里的 {ip} 会自动替换成上面填的设备 IP；"
             "历史命令按 ↑↓ 翻，Tab 补全脚本名。")
@@ -1614,7 +1593,7 @@ class CmdPanel(Panel):
 
 
 class ExportPanel(QWidget):
-    title = "⑪ 报告与文件"
+    title = "报告与文件"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1624,13 +1603,13 @@ class ExportPanel(QWidget):
         h = QLabel("报告与文件")
         h.setStyleSheet("font-size:17px;font-weight:600;color:#14181f")
         root.addWidget(h)
-        d = QLabel("脚本生成的 HTML / Excel 报告、电池 CSV 都存在这里，可直接发给别人。")
+        d = QLabel("查看已生成的检查报告和采样文件，打开文件夹以预览或导出。")
         d.setStyleSheet("color:#5b6472;font-size:12px")
         root.addWidget(d)
 
         row = QHBoxLayout()
-        b1 = QPushButton("打开 out 目录")
-        b2 = QPushButton("打开脚本目录")
+        b1 = QPushButton("打开报告文件夹")
+        b2 = QPushButton("打开项目文件夹")
         for b in (b1, b2):
             b.setFixedHeight(34)
             b.setStyleSheet(
@@ -1688,9 +1667,20 @@ def open_path(p: Path) -> None:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Ego-Std 交付测试台")
+        self.setWindowTitle("Ego-Std 测试工作台")
         self.resize(1180, 760)
-        self.setMinimumSize(940, 620)
+        self.setMinimumSize(1040, 700)
+        self.setStyleSheet("""
+            QWidget { font-family: 'Microsoft YaHei UI'; font-size: 12px; }
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+                min-height: 28px; border: 1px solid #d9dee6; border-radius: 5px;
+                padding: 2px 8px; background: white; }
+            QLineEdit:focus, QComboBox:focus { border-color: #1f6feb; }
+            QPushButton { min-height: 28px; padding: 2px 12px; }
+            QTableWidget { border: 1px solid #e3e6ea; gridline-color: #eef1f5; }
+            QHeaderView::section { background: #f6f7f9; padding: 7px; border: none; }
+            QCheckBox { spacing: 7px; padding: 4px; }
+        """)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1721,9 +1711,9 @@ class MainWindow(QMainWindow):
         body.addWidget(self.stack, 1)
         outer.addLayout(body, 1)
 
-        self.panels = [CheckupPanel(), CollectPanel(), BatchPanel(), FindPanel(), WatchPanel(),
-                       SerialPanel(), BatteryPanel(), SrcPanel(), LogPanel(), CmdPanel(),
-                       ExportPanel()]
+        self.app_patrol = AppPatrolPanel()
+        self.panels = [CheckupPanel(), CollectPanel(), BatchPanel(), WatchPanel(),
+                       BatteryPanel(), LogPanel(), ExportPanel(), self.app_patrol, SerialPanel(), SrcPanel(), CmdPanel()]
         for p in self.panels:
             title = getattr(p, "title", "")
             it = QListWidgetItem(title)
@@ -1731,20 +1721,31 @@ class MainWindow(QMainWindow):
             self.stack.addWidget(p)
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
         self.nav.currentRowChanged.connect(self._on_panel_changed)
+        self.advanced = QCheckBox("显示开发工具")
+        self.advanced.setToolTip("显示串口诊断、源码查看和命令调试")
+        self.advanced.toggled.connect(self._toggle_advanced)
+        outer.addWidget(self.advanced)
+        self._toggle_advanced(False)
         self.nav.setCurrentRow(0)
+        self.statusBar().showMessage("就绪 · 选择功能并确认参数后开始")
+
+    def _toggle_advanced(self, visible: bool) -> None:
+        if not visible and self.nav.currentRow() >= 8:
+            self.nav.setCurrentRow(0)
+        for row in range(8, len(self.panels)):
+            self.nav.item(row).setHidden(not visible)
+
+    def closeEvent(self, event):
+        if self.app_patrol.busy:
+            QMessageBox.information(self, "APP 巡检正在运行", "请先点击 APP 巡检页的停止按钮，等待结果保存后再关闭工作台。")
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _on_panel_changed(self, row: int) -> None:
         """切面板时让命令台刷新提示 —— 设备 IP 可能刚被改过。"""
         if 0 <= row < len(self.panels) and isinstance(self.panels[row], CmdPanel):
             self.panels[row]._sync_hint()
-
-        sb = QStatusBar()
-        sb.setStyleSheet("QStatusBar{background:#f6f7f9;border-top:1px solid #e3e6ea;"
-                         "color:#5b6472;font-size:12px}")
-        sb.showMessage("就绪")
-        self.setStatusBar(sb)
-
-        self.refresh_device_status()
 
     def _build_header(self) -> QWidget:
         w = QFrame()
@@ -1754,7 +1755,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(20, 0, 20, 0)
         lay.setSpacing(12)
 
-        name = QLabel("Ego-Std 交付测试台")
+        name = QLabel("Ego-Std 测试工作台")
         name.setStyleSheet("font-size:16px;font-weight:600;color:#14181f")
         lay.addWidget(name)
         lay.addSpacing(16)
@@ -1772,7 +1773,7 @@ class MainWindow(QMainWindow):
         self.ip.editingFinished.connect(self.refresh_device_status)
         lay.addWidget(self.ip)
 
-        btn_find = QPushButton("自动查找")
+        btn_find = QPushButton("查找设备")
         btn_find.setFixedHeight(32)
         btn_find.setStyleSheet(
             "QPushButton{background:#fff;color:#1a5fd0;border:1px solid #b9d2f7;"
@@ -1804,7 +1805,7 @@ class MainWindow(QMainWindow):
             return
         ok = probe_host(ip)
         self.dot.setStyleSheet(f"color:{C_OK if ok else C_BAD};font-size:15px")
-        self.host_state.setText("在线" if ok else "连不上")
+        self.host_state.setText("在线" if ok else "无法连接")
         self.host_state.setStyleSheet(
             f"color:{C_OK if ok else C_BAD};font-size:12px;font-weight:600"
         )
@@ -1823,12 +1824,12 @@ class MainWindow(QMainWindow):
         else:
             self.refresh_device_status()
             QMessageBox.information(
-                self, "没找到设备",
+                self, "未发现设备",
                 "当前网段没扫到 ego 设备。\n\n"
                 "检查：\n"
                 "· 设备和电脑是否在同一个 WiFi / 网段\n"
                 "· 设备是否已开机\n\n"
-                "也可以在「④ 设备发现」里指定额外网段再扫。"
+                "也可以手动输入设备 IP 后按回车重新检测。"
             )
 
     def scan_and_fill(self) -> None:
@@ -1863,12 +1864,19 @@ def screenshot(path: str) -> None:
     """逐个渲染各功能页并保存 PNG（用于文档/预览，也能在无人工干预下验证每个页面能正常绘制）。"""
     global WINDOW
     app = QApplication.instance() or QApplication(sys.argv)
+    if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+        from PySide6.QtGui import QFontDatabase
+        font_file = Path("C:/Windows/Fonts/msyh.ttc")
+        if font_file.is_file():
+            QFontDatabase.addApplicationFont(str(font_file))
     app.setStyle("Fusion")
     app.setFont(QFont("Microsoft YaHei UI", 9))
     w = MainWindow()
     WINDOW = w
     w.resize(1180, 760)
     w.show()
+    if "--app-patrol" in sys.argv:
+        w.nav.setCurrentRow(w.panels.index(w.app_patrol))
     app.processEvents()
 
     p = Path(path)
@@ -1907,9 +1915,12 @@ def main() -> None:
     w = MainWindow()
     WINDOW = w
     w.show()
+    if "--app-patrol" in sys.argv:
+        w.nav.setCurrentRow(w.panels.index(w.app_patrol))
     if w.device_ip():
-        from PySide6.QtCore import QTimer
         QTimer.singleShot(300, w.refresh_device_status)
+    if "--app-patrol" in sys.argv:
+        QTimer.singleShot(0, w.app_patrol.refresh_devices)
     sys.exit(app.exec())
 
 
