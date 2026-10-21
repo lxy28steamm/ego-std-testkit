@@ -41,12 +41,13 @@ class PatrolTests(unittest.TestCase):
     def test_navigation_keeps_app_patrol_visible(self):
         import app as workstation
         window = workstation.MainWindow()
-        self.assertEqual(11, window.stack.count())
+        self.assertEqual(12, window.stack.count())
         window.nav.setCurrentRow(7)
         window._toggle_advanced(False)
         self.assertEqual(7, window.nav.currentRow())
         self.assertFalse(window.nav.item(7).isHidden())
-        self.assertTrue(window.nav.item(8).isHidden())
+        self.assertFalse(window.nav.item(8).isHidden())
+        self.assertTrue(window.nav.item(9).isHidden())
         window.close()
 
     def test_patrol_controls_do_not_overlap_in_small_workbench(self):

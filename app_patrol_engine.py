@@ -59,7 +59,7 @@ def write_session(session):
     temp.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding='utf-8')
     temp.replace(target)
     from app_patrol_report import render_report
-    mode = '完整巡检清单（人工协同）' if session['mode'] == 'manual' else MODES[session['mode']][0]
+    mode = session.get('report_title') or ('完整巡检清单（人工协同）' if session['mode'] == 'manual' else MODES[session['mode']][0])
     (folder / 'summary.html').write_text(render_report(session, mode), encoding='utf-8')
     with (folder / 'cases.csv').open('w', encoding='utf-8-sig', newline='') as f:
         writer = csv.writer(f)

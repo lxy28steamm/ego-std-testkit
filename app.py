@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 
 BASE = Path(__file__).resolve().parent
 from app_patrol_panel import AppPatrolPanel
+from orangepi_panel import OrangePiPanel
 PYEXE = sys.executable
 DEVICE_FILE = BASE / "device_ip.txt"
 EXPORT_DIR = BASE / "out"          # 与 ego_api_test.py 的报告目录保持一致
@@ -1712,8 +1713,10 @@ class MainWindow(QMainWindow):
         outer.addLayout(body, 1)
 
         self.app_patrol = AppPatrolPanel()
+        self.orangepi = OrangePiPanel()
         self.panels = [CheckupPanel(), CollectPanel(), BatchPanel(), WatchPanel(),
-                       BatteryPanel(), LogPanel(), ExportPanel(), self.app_patrol, SerialPanel(), SrcPanel(), CmdPanel()]
+                       BatteryPanel(), LogPanel(), ExportPanel(), self.app_patrol, self.orangepi, SerialPanel(), SrcPanel(), CmdPanel()]
+        self._advanced_start = self.panels.index(self.orangepi) + 1
         for p in self.panels:
             title = getattr(p, "title", "")
             it = QListWidgetItem(title)
@@ -1730,12 +1733,16 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("就绪 · 选择功能并确认参数后开始")
 
     def _toggle_advanced(self, visible: bool) -> None:
-        if not visible and self.nav.currentRow() >= 8:
+        if not visible and self.nav.currentRow() >= self._advanced_start:
             self.nav.setCurrentRow(0)
-        for row in range(8, len(self.panels)):
+        for row in range(self._advanced_start, len(self.panels)):
             self.nav.item(row).setHidden(not visible)
 
     def closeEvent(self, event):
+        if self.orangepi.busy:
+            QMessageBox.information(self, "香橙派巡检正在运行", "请先停止香橙派巡检，等待连接结束和报告保存后再关闭。")
+            event.ignore()
+            return
         if self.app_patrol.busy:
             QMessageBox.information(self, "APP 巡检正在运行", "请先点击 APP 巡检页的停止按钮，等待结果保存后再关闭工作台。")
             event.ignore()
@@ -1877,6 +1884,8 @@ def screenshot(path: str) -> None:
     w.show()
     if "--app-patrol" in sys.argv:
         w.nav.setCurrentRow(w.panels.index(w.app_patrol))
+    if "--orangepi" in sys.argv:
+        w.nav.setCurrentRow(w.panels.index(w.orangepi))
     app.processEvents()
 
     p = Path(path)
@@ -1917,6 +1926,8 @@ def main() -> None:
     w.show()
     if "--app-patrol" in sys.argv:
         w.nav.setCurrentRow(w.panels.index(w.app_patrol))
+    if "--orangepi" in sys.argv:
+        w.nav.setCurrentRow(w.panels.index(w.orangepi))
     if w.device_ip():
         QTimer.singleShot(300, w.refresh_device_status)
     if "--app-patrol" in sys.argv:

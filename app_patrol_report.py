@@ -27,6 +27,9 @@ def short_detail(row):
 
 
 def render_report(session, mode_title):
+    board = session.get('mode') == 'orangepi'
+    report_title = '香橙派巡检报告' if board else 'APP 巡检报告'
+    device_label = 'SSH目标' if board else '手机'
     folder = Path(session['folder'])
     cases = session.get('cases', [])
     counts = Counter(x.get('status', '未执行') for x in cases)
@@ -75,10 +78,16 @@ def render_report(session, mode_title):
     waiting = session.get('waiting', {})
     target = session.get('target', {})
     target_html = ''.join(f'<span>{label} {esc(target[key])}</span>' for key,label in [('task_id','任务'),('device_sn','EGO'),('ssid','Wi-Fi')] if target.get(key))
+    if board:
+        identity=session.get('device_info',{})
+        target_html += ''.join(f'<span>{label} {esc(identity[key])}</span>' for key,label in [('model','型号'),('system','系统'),('kernel','内核')] if identity.get(key))
     waiting_html = f'<aside class="waiting"><strong>需要人工操作</strong><p>{esc(waiting.get("message", ""))}</p><p>完成后回到工作台点击“已完成，继续”。</p></aside>' if waiting else ''
-    scope = ('全量自动巡检包含 3 项框架检查和 9 项设备流程。未勾选的参数修改、录制及上传会记为未测。'
+    scope = ('本轮为Linux只读巡检。CPU为约1秒即时采样，阈值用于本轮提示，不替代长期稳定性或硬件验收。摄像头、串口、GPIO、GPU/NPU未做实际功能测试，枚举到节点不代表功能通过。' if board else
+            ('全量自动巡检包含 3 项框架检查和 9 项设备流程。未勾选的参数修改、录制及上传会记为未测。'
              '游客登录 5 项、当前预览独立检查 3 项需要不同前置条件，请在工作台对应模式另行执行；65 项完整人工清单也不计入本轮自动结果。') if session.get('mode') == 'flow_full' else (
-             '本报告只统计本轮检查，不继承历史通过结果。未测、未执行、待确认均不计为通过。')
+             '本报告只统计本轮检查，不继承历史通过结果。未测、未执行、待确认均不计为通过。'))
+    limitations = ('未测项需按权限、设备连接和硬件接线条件补测。服务处于active不等于业务功能验证通过；当前快照不代表长期稳定性。未安装软件、重启服务、修改网络、读写GPIO或进行压力测试。' if board else
+                  '若存在未测项，请根据完整记录补齐登录、设备连接、换卡或操作勾选，再运行相应流程。APP 的上传完成状态不代表云端转换或质检完成；文件时间戳检查不代表传感器物理同步。')
     comparison = ''
     if (folder/'recording_comparison.json').is_file():
         import json
@@ -89,19 +98,19 @@ def render_report(session, mode_title):
             comparison = '<h3>文件校验</h3>' + ''.join(f'<p><span class="badge {"pass" if value is True else "review"}">{"通过" if value is True else "需复核"}</span> {label}</p>' for label,value in items)
         except (OSError, ValueError, TypeError, AttributeError):
             comparison = '<p>文件对比结果无法读取，请查看原始记录。</p>'
-    return TEMPLATE.replace('<!--CONTENT-->', f'''
-<header><div class="eyebrow">EGO · APP TEST WORKBENCH</div><h1>APP 巡检报告</h1><p>{esc(mode_title)}</p>
-<div class="meta"><span>执行时间 {esc(session.get('created',''))}</span><span>手机 {esc(session.get('serial') or '本轮不操作手机')}</span>{target_html}<span>记录 {esc(session.get('id',''))}</span></div></header>
+    return TEMPLATE.replace('<title>APP 巡检报告</title>',f'<title>{report_title}</title>').replace('<!--CONTENT-->', f'''
+<header><div class="eyebrow">DEVICE TEST WORKBENCH</div><h1>{report_title}</h1><p>{esc(mode_title)}</p>
+<div class="meta"><span>执行时间 {esc(session.get('created',''))}</span><span>{device_label} {esc(session.get('serial') or '本轮不操作手机')}</span>{target_html}<span>记录 {esc(session.get('id',''))}</span></div></header>
 <main><nav><a href="#overview">结果概览</a><a href="#issues">问题与待确认</a><a href="#checks">检查列表</a><a href="#evidence">截图证据</a><button onclick="window.print()">打印 / 保存 PDF</button></nav>
 <section id="overview"><div class="section-title"><h2>结果概览</h2><span class="badge {tone}">{esc(state)}</span></div>
 <div class="conclusion {tone}">{conclusion}</div>{waiting_html}<div class="metrics">{cards}</div>
-<p class="muted">通过占比 {passed}/{total}（{round(passed/total*100) if total else 0}%）。统计范围为本轮已列出的检查，不代表全部 APP 功能覆盖率。</p></section>
+<p class="muted">通过占比 {passed}/{total}（{round(passed/total*100) if total else 0}%）。统计范围为本轮已列出的检查，不代表全部{'硬件与业务' if board else ' APP '}功能覆盖率。</p></section>
 <section id="issues"><h2>问题与待确认</h2>{issues_html}{comparison}</section>
 <section id="checks"><div class="section-title"><h2>检查列表</h2><span id="visible-count">共 {total} 项</span></div>
 <div class="filters"><label>结果 <select id="status"><option value="">全部结果</option>{''.join(f'<option>{s}</option>' for s in STATUS)}</select></label><label>搜索 <input id="search" placeholder="检查项、模块或记录" type="search"></label></div>
 <div class="table-wrap"><table><thead><tr><th>结果</th><th>检查项目</th><th>说明与记录</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div><p id="empty" hidden>没有符合条件的检查项。</p></section>
 <section id="evidence"><h2>截图证据</h2><p class="muted">点击缩略图查看原图。截图按生成顺序展示，具体步骤以文件名和检查记录为准。</p><div class="gallery">{''.join(evidence) or '<p>本轮没有生成截图证据。</p>'}</div></section>
-<section><h2>检查范围与下一步</h2><p>{scope}</p><p class="muted">若存在未测项，请根据完整记录补齐登录、设备连接、换卡或操作勾选，再运行相应流程。APP 的上传完成状态不代表云端转换或质检完成；文件时间戳检查不代表传感器物理同步。</p><div class="downloads">{links}</div></section>
+<section><h2>检查范围与下一步</h2><p>{scope}</p><p class="muted">{limitations}</p><div class="downloads">{links}</div></section>
 <footer>本报告由本轮 session.json 生成 · 历史记录与本轮结果独立保存</footer></main>''')
 
 
