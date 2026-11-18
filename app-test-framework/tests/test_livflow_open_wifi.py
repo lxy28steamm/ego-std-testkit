@@ -19,13 +19,22 @@ def preview(pytestconfig):
                               capture_output=True, timeout=40).stdout
 
     wifi = adb('shell', 'cmd', 'wifi', 'status').decode('utf-8')
-    adb('shell', 'uiautomator', 'dump', '/sdcard/codex-livflow.xml')
-    xml = adb('shell', 'cat', '/sdcard/codex-livflow.xml')
+    raw = adb('exec-out', 'uiautomator', 'dump', '/dev/tty')
+    start, end = raw.find(b'<hierarchy'), raw.rfind(b'</hierarchy>')
+    if start < 0 or end < start:
+        pytest.skip('设备未返回流式页面结构，未保存截图')
+    xml = raw[start:end+len(b'</hierarchy>')]
+    root = ET.fromstring(xml)
+    nodes = list(root.iter('node'))
+    labels = '\n'.join(n.get('content-desc', '') for n in nodes if n.get('class') != 'android.widget.EditText')
+    if (any(n.get('password') == 'true' for n in nodes) or
+        (any(n.get('class') == 'android.widget.EditText' for n in nodes) and '密码' in labels) or
+        '设备日志' in labels or '视频预览' not in labels):
+        pytest.skip('手机不在安全的视频预览页面；未保存截图')
     folder = pytestconfig.artifact_dir
     (folder / 'open-wifi-status.txt').write_text(wifi, encoding='utf-8')
     (folder / 'preview.xml').write_bytes(xml)
     (folder / 'preview.png').write_bytes(adb('exec-out', 'screencap', '-p'))
-    labels = '\n'.join(n.get('content-desc', '') for n in ET.fromstring(xml).iter('node'))
     return wifi, labels
 
 

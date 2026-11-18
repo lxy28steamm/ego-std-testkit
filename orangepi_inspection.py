@@ -59,6 +59,9 @@ def settings(host,username,port=22,services='ssh.service',temperature=80,disk=85
 
 
 def base_cases(config):
+    if config.get('acceptance'):
+        from orangepi_acceptance import cases
+        return cases(config['acceptance'])
     names=[('ssh','连接','SSH连接'),('identity','系统','板卡型号'),('system','系统','系统与内核'),
            ('uptime','系统','开机运行时长'),('cpu','资源','CPU即时使用率'),('memory','资源','可用内存'),
            ('disk','存储','根分区剩余空间'),('readonly','存储','根分区挂载状态'),
@@ -72,6 +75,9 @@ def base_cases(config):
 
 
 def evaluate(data,config,received=None):
+    if config.get('acceptance'):
+        from orangepi_acceptance import evaluate as accept
+        return accept(data,config['acceptance'],config.get('acceptance_rules'))
     rows=base_cases(config)
     by_id={x['id']:x for x in rows}
     def result(key,status,detail):
@@ -160,7 +166,7 @@ def evaluate(data,config,received=None):
 
 def fetch(client,config,cancel):
     source=(BASE/'orangepi_probe.py').read_text(encoding='utf-8')
-    payload=('SERVICE_UNITS='+repr(config['services'])+'\n'+source).encode('utf-8')
+    payload=('SERVICE_UNITS='+repr(config['services'])+'\nACCEPTANCE_DEVICE='+repr(config.get('acceptance',''))+'\nAPI_PORT='+repr(config.get('api_port',18000))+'\n'+source).encode('utf-8')
     channel=client.get_transport().open_session(timeout=10)
     channel.settimeout(10)
     try:
@@ -195,12 +201,15 @@ def fetch(client,config,cancel):
 
 
 def inspect(config,password='',key_file='',cancel=None,on_update=lambda session:None):
+    if config.get('framework_v2'):
+        from orangepi_modular import inspect as modular
+        return modular(config,password,key_file,cancel,on_update)
     cancel=cancel or threading.Event()
     stamp=datetime.now().strftime('%Y%m%d_%H%M%S')+'_'+uuid4().hex[:8]
     folder=BASE/'out/orangepi'/stamp
     folder.mkdir(parents=True)
     session=dict(schema=1,id=stamp,folder=str(folder),created=datetime.now().isoformat(timespec='seconds'),
-                 mode='orangepi',report_title='香橙派巡检报告',serial=config['host'],state='运行中',
+                 mode='orangepi',report_title=(config.get('acceptance','').upper()+' 整机功能验收报告' if config.get('acceptance') else '香橙派巡检报告'),acceptance_device=config.get('acceptance',''),serial=config['host'],state='运行中',
                  cases=base_cases(config),report=str(folder/'summary.html'))
     client=paramiko.SSHClient()
     client.load_system_host_keys()
@@ -211,19 +220,72 @@ def inspect(config,password='',key_file='',cancel=None,on_update=lambda session:
             raise Cancelled()
         write_session(session)
         on_update(session)
-        client.connect(config['host'],port=config['port'],username=config['username'],password=password or None,
-                       key_filename=key_file or None,look_for_keys=not password,allow_agent=not password,
-                       timeout=10,banner_timeout=10,auth_timeout=10)
-        data=fetch(client,config,cancel)
+        if config.get('test_record'):
+            if config.get('acceptance')!='umi': raise ValueError('实测目前仅支持 UMI')
+            from umi_functional import Client
+            api=Client(config['host'],config.get('api_port',18000))
+            health=api.call('/api/v2/health')
+            # Report only required identity; no login credentials are retained.
+            business_health={k:health.get(k) for k in ('selection','devices','workers','storage','session','recorder','host','overall_state')}
+            business_health['cloud']={k:(health.get('cloud') or {}).get(k) for k in ('device_sn','state','error_code','last_heartbeat_time_ns')}
+            def optional_api(path):
+                try:return api.call(path)
+                except Exception:return None
+            data={'schema':1,'business':{'health':business_health,'version':(api.call('/openapi.json').get('info') or {}).get('version',''),
+                                      'sensor':api.call('/api/v2/umi/sensor-status'),
+                                      'storage':optional_api('/api/v2/storage'),'bindings':optional_api('/api/v2/umi/bindings'),
+                                      'calibration':{hand:optional_api('/api/v2/umi/calibration/'+hand+'/info') for hand in ('left','right')},
+                                      'network':optional_api('/api/v2/network'),'wifi':optional_api('/api/v2/network/wifi')}}
+        else:
+            client.connect(config['host'],port=config['port'],username=config['username'],password=password or None,
+                           key_filename=key_file or None,look_for_keys=not password,allow_agent=not password,
+                           timeout=10,banner_timeout=10,auth_timeout=10)
+            data=fetch(client,config,cancel)
         if cancel.is_set():
             raise Cancelled()
         received=time.time()
         session['device_info']={key:data.get(key,'') for key in ('model','kernel','architecture')}
         session['device_info']['system']=data.get('system',{}).get('PRETTY_NAME','')
+        session['acceptance_device']=config.get('acceptance','')
+        session['report_title']=config.get('acceptance','').upper()+' 整机功能验收报告' if config.get('acceptance') else '香橙派巡检报告'
+        business=data.get('business',{})
+        session['device_info']['sn']=((business.get('health') or {}).get('cloud') or {}).get('device_sn','')
+        session['device_info']['version']=business.get('version','')
+        session['diagnostics_only']=True
         session['thresholds']=config['thresholds']
         session['ssh_port']=config['port']
+        session['acceptance_rules']=config.get('acceptance_rules',{})
         session['cases']=evaluate(data,config,received)
+        if config.get('test_record'):
+            from umi_functional import run
+            session['state']='运行中';write_session(session);on_update(session)
+            functional=run(config,folder,cancel)
+            session['functional']=dict(session_id=functional.get('session_id'),task=functional.get('test_task'),
+                                       evidence='functional.json',error=functional.get('error'))
+            lookup={r['id']:r for r in session['cases']}
+            for step in functional['steps']:
+                if step['id'] in lookup: lookup[step['id']].update(status=step['status'],detail=step['detail'])
+            if functional.get('session'):
+                current=functional['session']
+                lookup['ACC-session'].update(status='通过' if current.get('result')=='complete' else '待确认',detail='本轮会话 '+str(current.get('session_id'))+'；result='+str(current.get('result')))
+                # Additional quality checks bind to this run's final session, never old history.
+                from orangepi_acceptance_extra import evaluate as extra
+                current_business=dict(data['business'])
+                current_business['health']=dict(current_business['health'])
+                current_business['health']['session']=current
+                for item in extra(current_business,'umi',config.get('acceptance_rules')):
+                    if item['key'] not in ('login','login_reject'):
+                        lookup['ACC-'+item['key']].update(status=item['status'],detail=item['detail'])
+
+
+        if config.get('test_login') and config.get('acceptance'):
+            from umi_functional import Client
+            from orangepi_login_checks import run as login_checks
+            lookup={r['id']:r for r in session['cases']}
+            for item in login_checks(Client(config['host'],config.get('api_port',18000)),config.get('login_account',''),config.get('login_password','')):
+                lookup['ACC-'+item['key']].update(status=item['status'],detail=item['detail'])
         session['state']='已结束（含未测或待确认）' if any(x['status']!='通过' for x in session['cases']) else '已完成'
+        if cancel.is_set(): session['state']='已停止'
         if any(x['status']=='失败' for x in session['cases']):
             session['state']='检查失败'
         # Keep only whitelisted probe fields, never authentication details.
@@ -242,6 +304,8 @@ def inspect(config,password='',key_file='',cancel=None,on_update=lambda session:
         session['cases'][0].update(status='失败',detail=detail)
     finally:
         password=''
+        config.pop('login_password',None)
+        config.pop('login_account',None)
         client.close()
         for row in session['cases']:
             if row['status']=='未执行':
@@ -256,6 +320,9 @@ def inspect(config,password='',key_file='',cancel=None,on_update=lambda session:
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description='Read-only Orange Pi inspection')
+    p.add_argument('--device',choices=('auto','ego','umi','dex','system'),default='auto')
+    p.add_argument('--scope',choices=('all','host','peripheral'),default='all')
+    p.add_argument('--api-port',type=int,default=18000)
     p.add_argument('--host',required=True)
     p.add_argument('--user',default='orangepi')
     p.add_argument('--port',type=int,default=22)
@@ -265,10 +332,14 @@ if __name__=='__main__':
     p.add_argument('--password',action='store_true',help='Prompt for password; never pass it as an argument')
     a=p.parse_args()
     cfg=settings(a.host,a.user,a.port,a.services,trusted=a.trust_fingerprint)
+    if not 1<=a.api_port<=65535:
+        p.error('API端口范围为1～65535')
+    if a.device!='system':
+        cfg.update(acceptance=a.device,api_port=a.api_port,framework_v2=True,test_scope=a.scope)
     try:
         result=inspect(cfg,getpass.getpass('SSH password: ') if a.password else '',a.key_file)
         print(json.dumps({'state':result['state'],'counts':result['counts'],'report':result['report']},ensure_ascii=False))
-        raise SystemExit(1 if result['state']=='检查失败' else 0)
+        raise SystemExit(1 if result['state'] in ('检查失败','检查未完成') else 0)
     except UnknownHostKey as exc:
         print(str(exc))
         raise SystemExit(2)

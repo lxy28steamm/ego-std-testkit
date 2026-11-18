@@ -28,7 +28,7 @@ def short_detail(row):
 
 def render_report(session, mode_title):
     board = session.get('mode') == 'orangepi'
-    report_title = '香橙派巡检报告' if board else 'APP 巡检报告'
+    report_title = (session.get('report_title') or '香橙派巡检报告') if board else 'APP 巡检报告'
     device_label = 'SSH目标' if board else '手机'
     folder = Path(session['folder'])
     cases = session.get('cases', [])
@@ -77,17 +77,30 @@ def render_report(session, mode_title):
                         f'<figcaption>{esc(caption)}<small>{esc(p.name)}</small>{extra}</figcaption></figure>')
     waiting = session.get('waiting', {})
     target = session.get('target', {})
-    target_html = ''.join(f'<span>{label} {esc(target[key])}</span>' for key,label in [('task_id','任务'),('device_sn','EGO'),('ssid','Wi-Fi')] if target.get(key))
+    target_html = ''.join(f'<span>{label} {esc(target[key])}</span>' for key,label in [('task_id','任务'),('device_sn','EGO'),('ssid','Wi-Fi'),('wifi_security','网络类型')] if target.get(key))
     if board:
         identity=session.get('device_info',{})
-        target_html += ''.join(f'<span>{label} {esc(identity[key])}</span>' for key,label in [('model','型号'),('system','系统'),('kernel','内核')] if identity.get(key))
+        target_html += ''.join(f'<span>{label} {esc(identity[key])}</span>' for key,label in [('sn','设备 SN'),('version','软件版本'),('model','型号'),('system','系统'),('kernel','内核')] if identity.get(key))
     waiting_html = f'<aside class="waiting"><strong>需要人工操作</strong><p>{esc(waiting.get("message", ""))}</p><p>完成后回到工作台点击“已完成，继续”。</p></aside>' if waiting else ''
     scope = ('本轮为Linux只读巡检。CPU为约1秒即时采样，阈值用于本轮提示，不替代长期稳定性或硬件验收。摄像头、串口、GPIO、GPU/NPU未做实际功能测试，枚举到节点不代表功能通过。' if board else
             ('全量自动巡检包含 3 项框架检查和 9 项设备流程。未勾选的参数修改、录制及上传会记为未测。'
              '游客登录 5 项、当前预览独立检查 3 项需要不同前置条件，请在工作台对应模式另行执行；65 项完整人工清单也不计入本轮自动结果。') if session.get('mode') == 'flow_full' else (
              '本报告只统计本轮检查，不继承历史通过结果。未测、未执行、待确认均不计为通过。'))
+    if session.get('mode') == 'flow_full' and session.get('guest_tests_included'):
+        scope = ('本轮全量自动巡检包含 3 项框架、4 项游客和 9 项设备流程。游客检查不会自动退出账号；'
+                 '未勾选的参数修改、录制及上传记为未测。独立预览检查和65项人工清单需另行执行。')
+    if session.get('mode') == 'flow_full' and session.get('usb_scan_included'):
+        scope = ('本轮全量自动巡检包含 3 项框架、4 项游客、1 项 USB 空设备扫描和 9 项设备流程。'
+                 '游客检查不会自动退出账号，未勾选的实际操作记为未测。USB 实际连接采集、独立预览和65项人工清单需另行执行。')
+    if session.get('acceptance_device'):
+        scope = '本轮为 '+session['acceptance_device'].upper()+' 整机功能验收检查：自动读取业务接口；录制结果与数据流来自最近一次属于该设备的历史会话，不能替代本轮实际采集。未执行功能明确记为未测。'
     limitations = ('未测项需按权限、设备连接和硬件接线条件补测。服务处于active不等于业务功能验证通过；当前快照不代表长期稳定性。未安装软件、重启服务、修改网络、读写GPIO或进行压力测试。' if board else
                   '若存在未测项，请根据完整记录补齐登录、设备连接、换卡或操作勾选，再运行相应流程。APP 的上传完成状态不代表云端转换或质检完成；文件时间戳检查不代表传感器物理同步。')
+    if session.get('functional'):
+        scope='本轮执行 UMI 短采集、串口及传感器检查、MCAP 下载和完整性校验；结果见 functional.json。按键仅在观察到完整状态边沿时通过。'
+        links += '<a href="functional.json">本轮功能测试证据</a>'
+    if session.get('acceptance_device'):
+        limitations='历史记录不等同于本轮实采，设备统计不等同于 MCAP 独立解析；云端在线不等同于上传成功。未执行的专项必须补测。物理屏幕显示需现场确认；实测模式不读取系统诊断，诊断模式下系统资源不计入业务功能通过数。'
     comparison = ''
     if (folder/'recording_comparison.json').is_file():
         import json
@@ -98,12 +111,22 @@ def render_report(session, mode_title):
             comparison = '<h3>文件校验</h3>' + ''.join(f'<p><span class="badge {"pass" if value is True else "review"}">{"通过" if value is True else "需复核"}</span> {label}</p>' for label,value in items)
         except (OSError, ValueError, TypeError, AttributeError):
             comparison = '<p>文件对比结果无法读取，请查看原始记录。</p>'
+    module_summary=''
+    if session.get('framework_v2'):
+        profile=session.get('device_profile') or {}
+        scope='本轮范围：'+str(session.get('test_scope'))+'；外接专项：'+str(profile.get('family','')).upper()+' / '+str(profile.get('slot',''))+'。'+str(profile.get('guide',''))
+        limitations='主机常规与外接专项分别统计。识别只读生效配置，不切换机型或写标定；历史记录不等于本轮实采。未测与待确认不计通过，标定精度和长期稳定性需另测。'
+        for key,label in [('host','主机常规'),('peripheral',str(profile.get('family','外接')).upper()+' 专项')]:
+            selected=[x for x in cases if x.get('scope')==key]
+            if selected:
+                c=Counter(x.get('status') for x in selected)
+                module_summary+='<p><strong>'+esc(label)+'</strong>：'+str(len(selected))+' 项 · '+esc(' / '.join(str(k)+' '+str(v) for k,v in c.items()))+'</p>'
     return TEMPLATE.replace('<title>APP 巡检报告</title>',f'<title>{report_title}</title>').replace('<!--CONTENT-->', f'''
 <header><div class="eyebrow">DEVICE TEST WORKBENCH</div><h1>{report_title}</h1><p>{esc(mode_title)}</p>
 <div class="meta"><span>执行时间 {esc(session.get('created',''))}</span><span>{device_label} {esc(session.get('serial') or '本轮不操作手机')}</span>{target_html}<span>记录 {esc(session.get('id',''))}</span></div></header>
 <main><nav><a href="#overview">结果概览</a><a href="#issues">问题与待确认</a><a href="#checks">检查列表</a><a href="#evidence">截图证据</a><button onclick="window.print()">打印 / 保存 PDF</button></nav>
 <section id="overview"><div class="section-title"><h2>结果概览</h2><span class="badge {tone}">{esc(state)}</span></div>
-<div class="conclusion {tone}">{conclusion}</div>{waiting_html}<div class="metrics">{cards}</div>
+<div class="conclusion {tone}">{conclusion}</div>{waiting_html}<div class="metrics">{cards}</div>{module_summary}
 <p class="muted">通过占比 {passed}/{total}（{round(passed/total*100) if total else 0}%）。统计范围为本轮已列出的检查，不代表全部{'硬件与业务' if board else ' APP '}功能覆盖率。</p></section>
 <section id="issues"><h2>问题与待确认</h2>{issues_html}{comparison}</section>
 <section id="checks"><div class="section-title"><h2>检查列表</h2><span id="visible-count">共 {total} 项</span></div>

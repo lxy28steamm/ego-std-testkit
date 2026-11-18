@@ -50,3 +50,6 @@ desktop.ini
 **/config/local.yaml
 *.apk
 *.mp4
+
+# Dated local backups
+*.bak-*

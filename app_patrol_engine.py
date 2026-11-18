@@ -22,7 +22,10 @@ MODES = {
     'selfcheck': ('框架自检', 'tests/test_config.py'),
     'smoke': ('LivFlow 基础自动巡检', 'tests/test_livflow_adb.py'),
     'preview': ('LivFlow 预览只读检查', 'tests/test_livflow_open_wifi.py'),
+    'flow_guest': ('游客模式与登录校验', 'tests/test_livflow_guest.py'),
+    'flow_usb': ('USB 相机空设备扫描', 'tests/test_livflow_usb.py'),
     'flow_tasks': ('任务搜索、筛选与统计', 'tests/test_livflow_workflows.py'),
+    'flow_filters': ('任务状态和时长筛选', 'tests/test_livflow_workflows.py'),
     'flow_settings': ('语言、版本与日志导出', 'tests/test_livflow_workflows.py'),
     'flow_connect': ('指定 EGO 连接及配网', 'tests/test_livflow_workflows.py'),
     'flow_parameters': ('IMU 参数修改、回读与恢复', 'tests/test_livflow_workflows.py'),
@@ -70,9 +73,11 @@ def write_session(session):
                              else row.get(k, '') for k in ('id', 'module', 'title', 'status', 'detail')])
 
 
-def manual_session(framework):
+def manual_session(framework, catalogue_file='app_patrol_catalog.json', report_title=None):
     session = new_session('manual', framework=framework)
-    catalogue = json.loads((BASE / 'app_patrol_catalog.json').read_text(encoding='utf-8'))
+    catalogue = json.loads((BASE / catalogue_file).read_text(encoding='utf-8'))
+    if report_title:
+        session['report_title'] = report_title
     session['cases'] = [dict(id=x['id'], module=x['module'], title=x['title'],
                              status='未执行', detail='', scope=x.get('scope', '')) for x in catalogue]
     session['state'] = '人工巡检进行中'
@@ -125,14 +130,20 @@ def run(mode, framework, serial, cancel_file, flow_config=None, allow_parameters
     test = root / MODES[mode][1]
     if not python.is_file() or not test.is_file():
         raise RuntimeError('测试框架路径或独立 Python 环境不完整，请选择 app-test-framework 文件夹')
+    if mode == 'flow_full' and any(not (root/'tests'/name).is_file() for name in ('test_livflow_guest.py','test_livflow_usb.py')):
+        raise RuntimeError('所选框架未包含游客或USB检查，请选择工作台内更新后的 app-test-framework')
     if mode not in ('selfcheck','files') and not serial:
         raise RuntimeError('必须选择明确的 Android 设备序列号')
     with execution_lock():
         session = new_session(mode, serial, str(root))
+        if mode == 'flow_full':
+            session['guest_tests_included'] = True
+            session['usb_scan_included'] = True
         session['operations'] = dict(parameters=allow_parameters, record=allow_record, upload=allow_upload)
         if flow_config:
             settings = json.loads(Path(flow_config).read_text(encoding='utf-8'))
             session['target'] = {key: settings.get(key, '') for key in ('task_id','device_sn','ssid')}
+            session['target']['wifi_security'] = {'open':'免密码','protected':'加密'}.get(settings.get('wifi_security','open'),'未识别')
             if mode == 'flow_full' and allow_record and allow_upload and settings.get('recording_dir'):
                 raise RuntimeError('全量包含新录制时，请先在流程配置清空“手机 TF 卡测试目录”；上传阶段再选择本轮新目录，避免上传旧记录。')
         session['state'] = '运行中'
@@ -143,7 +154,7 @@ def run(mode, framework, serial, cancel_file, flow_config=None, allow_parameters
                 '--artifact-dir', str(folder), '--html', str(folder / 'report.html'),
                 '--self-contained-html', '--junitxml', str(folder / 'junit.xml')]
         if mode == 'flow_full':
-            args.insert(3, str(root / 'tests/test_config.py'))
+            args[3:3] = [str(root / 'tests/test_config.py'), str(root / 'tests/test_livflow_guest.py'),str(root / 'tests/test_livflow_usb.py')]
         if mode not in ('selfcheck','files'):
             args.append('--device')
         if mode.startswith('flow_'):

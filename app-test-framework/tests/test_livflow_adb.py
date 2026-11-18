@@ -25,8 +25,11 @@ class Android:
                               capture_output=True, check=True, timeout=45).stdout
 
     def tree(self):
-        self.command('shell', 'uiautomator', 'dump', '/sdcard/codex-livflow.xml')
-        self.xml = self.command('shell', 'cat', '/sdcard/codex-livflow.xml')
+        raw = self.command('exec-out', 'uiautomator', 'dump', '/dev/tty')
+        start, end = raw.find(b'<hierarchy'), raw.rfind(b'</hierarchy>')
+        if start < 0 or end < start:
+            raise RuntimeError('无法安全读取手机界面；当前设备未返回流式页面结构')
+        self.xml = raw[start:end+len(b'</hierarchy>')]
         return ET.fromstring(self.xml)
 
     def labels(self):
@@ -64,9 +67,15 @@ def android(request, pytestconfig):
         safe_name += '_' + hashlib.sha256(request.node.nodeid.encode()).hexdigest()[:8]
         target = pytestconfig.artifact_dir / safe_name
         try:
-            device.tree()
-            target.with_suffix('.xml').write_bytes(device.xml)
-            target.with_suffix('.png').write_bytes(device.command('exec-out', 'screencap', '-p'))
+            root = device.tree()
+            nodes = list(root.iter('node'))
+            labels = '\n'.join(n.get('content-desc') or n.get('text','') for n in nodes if n.get('class') != 'android.widget.EditText')
+            sensitive = (any(n.get('password') == 'true' for n in nodes) or
+                (any(n.get('class') == 'android.widget.EditText' for n in nodes) and '密码' in labels) or
+                '设备日志' in labels)
+            if not sensitive:
+                target.with_suffix('.xml').write_bytes(device.xml)
+                target.with_suffix('.png').write_bytes(device.command('exec-out', 'screencap', '-p'))
         except Exception as exc:
             request.node.add_report_section('teardown', 'Evidence failure', str(exc))
 

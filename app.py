@@ -1744,7 +1744,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         if self.app_patrol.busy:
-            QMessageBox.information(self, "APP 巡检正在运行", "请先点击 APP 巡检页的停止按钮，等待结果保存后再关闭工作台。")
+            QMessageBox.information(self, "APP 巡检正在运行", "若正在安装 APK，请等待安装结束；若正在巡检，请先停止并等待结果保存后再关闭。")
             event.ignore()
             return
         super().closeEvent(event)

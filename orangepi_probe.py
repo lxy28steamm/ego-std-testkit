@@ -124,6 +124,25 @@ def collect(services):
     data['serial_nodes']=sorted(glob.glob('/dev/ttyUSB*')+glob.glob('/dev/ttyACM*'))
     data['gpio_nodes']=sorted(glob.glob('/dev/gpiochip*'))
     data['accelerator_nodes']=sorted(glob.glob('/dev/dri/renderD*')+glob.glob('/dev/rknpu*'))
+    # Query loopback only. Retain only fields needed for acceptance, never cloud credentials.
+    import urllib.request
+    opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    def api_get(path):
+        try:
+            with opener.open('http://127.0.0.1:'+str(globals().get('API_PORT',18000))+path,timeout=4) as response:
+                return json.loads(response.read(262144))
+        except Exception:
+            return {}
+    health=api_get('/api/v2/health')
+    safe={k:health[k] for k in ('selection','devices','workers','storage','session','recorder','host','overall_state') if k in health}
+    safe['cloud']={k:(health.get('cloud') or {}).get(k) for k in ('device_sn','state','error_code','last_heartbeat_time_ns')}
+    spec=api_get('/openapi.json')
+    sensor=api_get('/api/v2/umi/sensor-status') if globals().get('ACCEPTANCE_DEVICE')=='umi' else {}
+    data['business']={'health':safe if health else {},'version':(spec.get('info') or {}).get('version',''),
+                      'storage':api_get('/api/v2/storage'),'bindings':api_get('/api/v2/umi/bindings'),
+                      'calibration':{hand:api_get('/api/v2/umi/calibration/'+hand+'/info') for hand in ('left','right')},
+                      'network':api_get('/api/v2/network'),'wifi':api_get('/api/v2/network/wifi'),
+                      'sensor':{k:sensor[k] for k in ('state','sides') if k in sensor}}
     data['utc']=datetime.datetime.now(datetime.timezone.utc).timestamp()
     return data
 

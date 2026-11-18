@@ -27,18 +27,32 @@ CMDS = [
 import devip
 
 HOST = devip.resolve_host(HOST)
+print(f"目标 {HOST}（ssh ls@…，只读，不改设备）")
 
+# 设备连不上是常态（关机 / 换网段 / IP 漂了），不能让它甩一坨 traceback 到面板日志里 ——
+# 其他兄弟脚本（container_src / imu_serial_probe / collect_and_upload）都给了一行人话。
 c = paramiko.SSHClient()
 c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-c.connect(HOST, username="ls", password="ls", timeout=15)
+try:
+    c.connect(HOST, username="ls", password="ls", timeout=15)
+except Exception as exc:  # noqa: BLE001
+    print(f"SSH 连接失败：{type(exc).__name__}: {exc}")
+    print("先确认：设备开机了吗 / IP 变了吗（用 ④设备发现 扫一遍，或 run.bat 选 8） / "
+          "和本机在同一网段吗（ipconfig 看本机 IPv4）")
+    sys.exit(2)
+print(f"已连上 {HOST}，开始逐项探日志…")
 
 for title, cmd in CMDS:
     print("=" * 70)
     print("### %s" % title)
     print("-" * 70)
-    _, o, e = c.exec_command(cmd, timeout=90)
-    out = o.read().decode("utf-8", "replace").strip()
-    err = e.read().decode("utf-8", "replace").strip()
+    try:
+        _, o, e = c.exec_command(cmd, timeout=90)
+        out = o.read().decode("utf-8", "replace").strip()
+        err = e.read().decode("utf-8", "replace").strip()
+    except Exception as exc:  # noqa: BLE001
+        print(f"(这条没取到：{type(exc).__name__}: {exc})")
+        continue
     print(out if out else ("(stderr) " + err if err else "(空)"))
 
 c.close()

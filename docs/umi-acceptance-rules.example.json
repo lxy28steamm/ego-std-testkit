@@ -1,0 +1,9 @@
+{
+  "storage_min_gib": 2,
+  "heartbeat_max_sec": 300,
+  "disk_latency_max_ms": null,
+  "battery_min_mv": null,
+  "battery_max_mv": null,
+  "charging_current_sign": null,
+  "streams": {}
+}

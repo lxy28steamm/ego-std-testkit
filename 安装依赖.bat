@@ -47,7 +47,7 @@ echo [2/3] 正在安装依赖（PySide6 / paramiko / openpyxl）…
 echo       首次安装需要下载约 150MB，请耐心等待。
 echo.
 ".venv-gui\Scripts\python.exe" -m pip install --upgrade pip -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
-".venv-gui\Scripts\python.exe" -m pip install PySide6 paramiko openpyxl -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
+".venv-gui\Scripts\python.exe" -m pip install PySide6 paramiko openpyxl mcap -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com
 if errorlevel 1 (
   echo.
   echo [错误] 依赖安装失败。若是网络问题，重跑一次本脚本即可。

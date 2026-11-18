@@ -53,6 +53,7 @@ def test_flow_search_and_reset(flow):
 
 
 @pytest.mark.flow_tasks
+@pytest.mark.flow_filters
 def test_flow_filters(flow):
     perform(flow,'filters')
 

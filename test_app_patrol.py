@@ -10,7 +10,8 @@ import unittest
 from unittest.mock import patch
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QApplication, QComboBox, QCheckBox
 
 import app_patrol_engine as engine
 from app_patrol_panel import AppPatrolPanel, default_framework
@@ -37,6 +38,25 @@ class PatrolTests(unittest.TestCase):
             restored = json.loads((Path(data['folder']) / 'session.json').read_text(encoding='utf-8'))
             self.assertEqual('失败', restored['cases'][0]['status'])
             self.assertEqual(64, restored['counts']['未执行'])
+
+    def test_emg_manual_checklist_starts_unexecuted_and_preserves_existing_catalog(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(engine, 'RUNS', Path(tmp)):
+            emg = engine.manual_session(FRAMEWORK, 'app_emg_catalog.json', '肌电手环专项清单（人工记录）')
+            original = engine.manual_session(FRAMEWORK)
+            self.assertEqual(23, len(emg['cases']))
+            self.assertEqual({'未执行': 23}, emg['counts'])
+            self.assertTrue(all(x['id'].startswith('EMG-') and x['scope'] for x in emg['cases']))
+            self.assertEqual(65, len(original['cases']))
+            self.assertIn('肌电手环专项清单', Path(emg['report']).read_text(encoding='utf-8'))
+
+    def test_emg_checklist_button_creates_editable_independent_session(self):
+        panel = AppPatrolPanel()
+        with tempfile.TemporaryDirectory() as tmp, patch.object(engine, 'RUNS', Path(tmp)), patch('app_patrol_panel.RUNS', Path(tmp)):
+            panel.create_emg_manual()
+            self.assertEqual('manual', panel.session['mode'])
+            self.assertEqual(23, len(panel.session['cases']))
+            self.assertFalse(panel.read_only)
+            self.assertTrue(panel.save.isEnabled())
 
     def test_navigation_keeps_app_patrol_visible(self):
         import app as workstation
@@ -160,6 +180,25 @@ class PatrolTests(unittest.TestCase):
         panel._controls(False)
         panel.close()
 
+    def test_wifi_configuration_saves_security_type_without_password(self):
+        panel=AppPatrolPanel()
+        with tempfile.TemporaryDirectory() as tmp:
+            panel.flow_config_path=Path(tmp)/'flow.json'
+            def complete_dialog():
+                dialog=self.app.activeModalWidget()
+                choice=next(x for x in dialog.findChildren(QComboBox) if x.findData('protected')>=0)
+                choice.setCurrentIndex(choice.findData('protected'))
+                checkbox=next(x for x in dialog.findChildren(QCheckBox) if '重新配网' in x.text())
+                checkbox.setChecked(True)
+                dialog.accept()
+            QTimer.singleShot(0,complete_dialog)
+            panel.configure_flow()
+            saved=json.loads(panel.flow_config_path.read_text(encoding='utf-8'))
+            self.assertEqual('protected',saved['wifi_security'])
+            self.assertTrue(saved['require_wifi_provisioning'])
+            self.assertNotIn('password',saved)
+        panel.close()
+
     def test_report_distinguishes_unfinished_and_escapes_evidence(self):
         from app_patrol_report import render_report
         with tempfile.TemporaryDirectory() as tmp:
@@ -175,7 +214,7 @@ class PatrolTests(unittest.TestCase):
             self.assertIn('id="search"',page)
             self.assertIn('id="status"',page)
 
-    def test_full_dispatch_collects_twelve_without_operating_device(self):
+    def test_full_dispatch_collects_seventeen_without_operating_device(self):
         original_popen = subprocess.Popen
         commands = []
         def collect_only(args, **kwargs):
@@ -186,8 +225,8 @@ class PatrolTests(unittest.TestCase):
             code = engine.run('flow_full',FRAMEWORK,'offline-collect-only',None)
             saved = json.loads(next(Path(tmp).glob('*/session.json')).read_text(encoding='utf-8'))
             self.assertEqual(0,code)
-            self.assertEqual(12,len(saved['cases']))
-            self.assertEqual({'未测':12},saved['counts'])
+            self.assertEqual(17,len(saved['cases']))
+            self.assertEqual({'未测':17},saved['counts'])
             self.assertNotEqual('已完成',saved['state'])
             self.assertIn('--device',commands[0])
             self.assertNotIn('-m',commands[0][3:])

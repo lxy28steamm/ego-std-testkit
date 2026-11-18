@@ -2,6 +2,7 @@
   "task_id": "",
   "device_sn": "",
   "ssid": "灵生测试",
+  "wifi_security": "open",
   "record_seconds": 15,
   "background_seconds": 5,
   "recording_dir": "",

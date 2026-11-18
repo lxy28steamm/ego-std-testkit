@@ -1,0 +1,137 @@
+{
+  "info": {
+    "name": "香橙派只读接口起步测试",
+    "description": "仅检查响应码和基础结构，不代表整机通过；Wi-Fi 查询需至少 20 秒超时。",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://192.168.50.25:18000",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "健康状态",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/v2/health",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "v2",
+            "health"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP status is 200', function () { pm.response.to.have.status(200); });",
+              "pm.test('Response is JSON with expected basic structure', function () { var body = pm.response.json(); pm.expect(body).to.be.an('object'); pm.expect(body).to.have.property('overall_state'); });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "存储选项",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/v2/storage",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "v2",
+            "storage"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP status is 200', function () { pm.response.to.have.status(200); });",
+              "pm.test('Response is JSON with expected basic structure', function () { var body = pm.response.json(); pm.expect(body).to.be.an('object'); pm.expect(body).to.have.property('current'); });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "网络状态",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/v2/network",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "v2",
+            "network"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP status is 200', function () { pm.response.to.have.status(200); });",
+              "pm.test('Response is JSON with expected basic structure', function () { var body = pm.response.json(); pm.expect(body).to.be.an('object'); pm.expect(body).to.have.property('connected'); });"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Wi-Fi 网络",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/api/v2/network/wifi",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "v2",
+            "network",
+            "wifi"
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('HTTP status is 200', function () { pm.response.to.have.status(200); });",
+              "pm.test('Response is JSON with expected basic structure', function () { var body = pm.response.json(); pm.expect(body).to.be.an('array'); });"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

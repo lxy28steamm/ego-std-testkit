@@ -88,8 +88,10 @@ class AppPatrolPanel(QWidget):
         self.mode.addItem('框架自检 · 3 项，不操作手机', 'selfcheck')
         self.mode.addItem('LivFlow 基础巡检 · 5 项，会重启 APP', 'smoke')
         self.mode.addItem('LivFlow 预览检查 · 3 项，只读当前页面', 'preview')
-        self.mode.addItem('全量自动巡检 · 3 项框架 + 9 项设备流程', 'flow_full')
-        for label,value in [('任务搜索、筛选、详情与统计','flow_tasks'),('语言、版本与日志导出','flow_settings'),
+        self.mode.addItem('游客模式与空登录校验 · 4 项', 'flow_guest')
+        self.mode.addItem('USB 相机无设备扫描 · 1 项', 'flow_usb')
+        self.mode.addItem('全量自动巡检 · 3 框架 + 4 游客 + 1 USB + 9 设备流程', 'flow_full')
+        for label,value in [('任务搜索、筛选、详情与统计','flow_tasks'),('任务筛选专项','flow_filters'),('语言、版本与日志导出','flow_settings'),
             ('指定 EGO 连接、配网与预览','flow_connect'),('IMU 参数写入与恢复','flow_parameters'),
             ('实际短采集与后台返回','flow_record'),('测试文件写入、上传与防重复','flow_upload'),
             ('扩展流程巡检（按下方勾选允许实际操作）','flow_all'),('本地 MCAP 文件校验','files')]:
@@ -98,6 +100,10 @@ class AppPatrolPanel(QWidget):
         grid.addWidget(QLabel('自动检查'), 2, 0)
         grid.addWidget(self.mode, 2, 1, 1, 2)
         root.addLayout(grid)
+        from app_apk_update_panel import ApkUpdatePanel
+        self.apk_update=ApkUpdatePanel(self.selected_serial,lambda:self._busy,self)
+        self.apk_update.busyChanged.connect(self._apk_busy_changed)
+        root.addWidget(self.apk_update)
         self.hint = QLabel()
         self.hint.setWordWrap(True)
         self.hint.setStyleSheet('color:#5b6472')
@@ -115,7 +121,7 @@ class AppPatrolPanel(QWidget):
         buttons = QHBoxLayout()
         self.full = QPushButton('全量巡检')
         self.full.setStyleSheet('background:#173c68;color:white;border-radius:5px;padding:6px 16px;font-weight:600')
-        self.full.setToolTip('运行3项框架检查和9项设备流程。实际操作按下方勾选；未允许的项目记为未测。')
+        self.full.setToolTip('运行3项框架、4项游客、1项USB空设备及9项设备流程。游客检查不会自动退出账号；实际操作按勾选执行。')
         self.full.clicked.connect(self.start_full_run)
         root.addWidget(self.full)
         self.start = QPushButton('执行自动检查')
@@ -137,6 +143,9 @@ class AppPatrolPanel(QWidget):
         for w in (self.start, self.stop, self.configure, self.resume, self.new_manual, self.open_report):
             buttons.addWidget(w)
         root.addLayout(buttons)
+        self.new_emg = QPushButton('新建肌电手环专项清单（人工记录）')
+        self.new_emg.clicked.connect(self.create_emg_manual)
+        root.addWidget(self.new_emg)
         history_row = QHBoxLayout()
         self.history = QComboBox()
         self.history.setMinimumWidth(270)
@@ -212,8 +221,10 @@ class AppPatrolPanel(QWidget):
         self.hint.setText({'selfcheck': '检查配置校验逻辑，不连接或操作手机。',
             'smoke': '前提：LivFlow 已安装、已退出账号、界面语言为中文。会重启 APP，检查空表单、游客导航和语言切换。',
             'preview': '前提：手机与设备已接入无密码“灵生测试”Wi-Fi，LivFlow 正在中文双目预览页。不会自动连接、配网或开始采集。',
+            'flow_guest': '前提：当前处于游客状态。检查空登录、任务页、蓝牙/USB入口与我的页面；不会自动退出已有账号或接受协议。',
+            'flow_usb': '检查未连接 USB 相机时的扫描提示。相机权限需要你在手机上处理；不会连接相机或开始采集。',
             'files':'在流程配置选择本地 MCAP；可选择写入前文件作逐消息及元数据对比，不操作手机。'
-            ,'flow_full':'全量范围：3项框架 + 9项设备流程。未勾选的实际操作记未测。游客登录5项、独立预览3项需另选模式；65项人工清单另行记录。先核对流程配置，登录或换卡时按提示继续。'
+            ,'flow_full':'全量范围：3项框架 + 4项游客 + 1项USB空设备 + 9项设备流程。游客检查不会自动退出账号；未勾选的实际操作记未测。独立预览3项、65项人工清单另行执行。'
             }.get(mode,'先点“流程配置”指定任务编号、EGO序列号等。需要登录、换网络或插卡时会等待，完成后点“已完成，继续”。不执行固件升级和删除。'))
 
     def configure_flow(self):
@@ -225,7 +236,16 @@ class AppPatrolPanel(QWidget):
             config = {}
         dialog = QDialog(self)
         dialog.setWindowTitle('本轮流程配置')
-        form = QFormLayout(dialog)
+        dialog.resize(700, 620)
+        layout = QVBoxLayout(dialog)
+        scroll = QScrollArea(dialog)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        form_widget = QWidget()
+        form = QFormLayout(form_widget)
+        form.setVerticalSpacing(8)
+        scroll.setWidget(form_widget)
+        layout.addWidget(scroll)
         controls = {}
         fields = [('task_id','测试任务编号'),('device_sn','指定 EGO 序列号'),('ssid','测试 Wi-Fi 名称'),
                   ('recording_dir','手机 TF 卡测试目录（可选）'),('mcap_file','本地 MCAP 文件（文件校验用）'),
@@ -247,6 +267,16 @@ class AppPatrolPanel(QWidget):
                 form.addRow(label,row)
             else:
                 form.addRow(label,entry)
+        security = QComboBox()
+        security.addItem('免密码网络','open')
+        security.addItem('加密网络（手机填写密码）','protected')
+        security.setCurrentIndex(max(0,security.findData(config.get('wifi_security','open'))))
+        controls['wifi_security'] = security
+        form.addRow('网络类型',security)
+        provisioning = QCheckBox('要求本轮重新配网，不能只沿用已连接设备')
+        provisioning.setChecked(config.get('require_wifi_provisioning',False) is True)
+        controls['require_wifi_provisioning'] = provisioning
+        form.addRow('配网验证',provisioning)
         for key,label,lo,hi,value in [('record_seconds','短采集秒数',5,120,15),('background_seconds','切后台秒数',0,30,5)]:
             entry = QSpinBox()
             entry.setRange(lo,hi)
@@ -259,10 +289,10 @@ class AppPatrolPanel(QWidget):
         buttons = QDialogButtonBox(QDialogButtonBox.Save|QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
-        form.addRow(buttons)
+        layout.addWidget(buttons)
         if dialog.exec() == QDialog.Accepted:
             for key,entry in controls.items():
-                config[key]=entry.value() if isinstance(entry,QSpinBox) else entry.text().strip()
+                config[key]=entry.isChecked() if isinstance(entry,QCheckBox) else entry.value() if isinstance(entry,QSpinBox) else entry.currentData() if isinstance(entry,QComboBox) else entry.text().strip()
             config.setdefault('human_timeout',900)
             config.setdefault('wait_timeout',90)
             self.flow_config_path.parent.mkdir(parents=True,exist_ok=True)
@@ -311,12 +341,19 @@ class AppPatrolPanel(QWidget):
         data = self.devices.currentData()
         return data if data and text == self.devices.itemText(self.devices.currentIndex()) else text
 
+    def _apk_busy_changed(self,busy):
+        self._controls(busy)
+        self.stop.setEnabled(False)
+        if not busy:self.log.appendPlainText('APP 版本操作结束，结果见版本更新区域；巡检记录未改写。')
+
     def _controls(self, busy):
         self._busy = busy
-        for w in (self.start, self.full, self.new_manual, self.load, self.framework, self.mode, self.devices, self.refresh, self.rescan, self.browse, self.history,self.configure,self.allow_parameters,self.allow_record,self.allow_upload):
+        for w in (self.start, self.full, self.new_manual, self.new_emg, self.load, self.framework, self.mode, self.devices, self.refresh, self.rescan, self.browse, self.history,self.configure,self.allow_parameters,self.allow_record,self.allow_upload):
             w.setEnabled(not busy)
         self.stop.setEnabled(busy)
         self.idle.setEnabled(not busy)
+        if hasattr(self,'apk_update') and not self.apk_update.busy:
+            self.apk_update.setEnabled(not busy)
         self._enable_edit(not busy and self.session is not None and not self.read_only and self.session['mode'] == 'manual')
 
     def start_full_run(self):
@@ -468,6 +505,18 @@ class AppPatrolPanel(QWidget):
         self._enable_edit(True)
         self.refresh_history()
         self.log.appendPlainText('新建完整清单：全部为未执行。实际采集、上传等步骤需按本轮环境执行后手工记录。')
+
+    def create_emg_manual(self):
+        if self.busy:
+            return
+        self.session = manual_session(self.framework.text().strip(), 'app_emg_catalog.json', '肌电手环专项清单（人工记录）')
+        self.session['serial'] = self.selected_serial()
+        self.read_only = False
+        write_session(self.session)
+        self._render()
+        self._enable_edit(True)
+        self.refresh_history()
+        self.log.appendPlainText('肌电专项清单：全部未执行；项目是待验证范围，不代表 APP 已支持或已自动测试。')
 
     def _render(self):
         if not self.session:

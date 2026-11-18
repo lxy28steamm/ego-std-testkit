@@ -4,6 +4,11 @@ import pytest
 
 PREFIX = '@@APP_PATROL@@'
 NAMES = {
+    'test_usb_camera_empty_scan': 'USB 相机无设备扫描提示',
+    'test_guest_empty_login': '游客空登录校验',
+    'test_guest_task_center': '游客任务页与登录提示',
+    'test_guest_device_modes': '游客蓝牙与USB设备入口',
+    'test_guest_profile_entries': '游客我的页面入口',
     'test_flow_search_and_reset': '任务搜索与重置',
     'test_flow_filters': '任务状态及时间筛选',
     'test_flow_task_statistics': '指定任务详情及统计刷新',
@@ -56,7 +61,10 @@ def pytest_runtest_makereport(item, call):
         result['status'] = '失败' if failed else '未测' if skipped else '通过'
         result['detail'] = str(failed.longrepr)[-800:] if failed else str(skipped.longrepr) if skipped else '自动断言通过'
         observations = getattr(item,'patrol_observations',[])
+        steps = getattr(item,'patrol_steps',[])
         if observations and not failed and not skipped:
             result['status'] = '待确认'
             result['detail'] = '；'.join(observations)
+        elif steps and not failed and not skipped:
+            result['detail'] = '；'.join(steps[-8:])
         emit('case', case=result)
