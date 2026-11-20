@@ -454,6 +454,10 @@ powershell -ExecutionPolicy Bypass -File .\install-app-tests.ps1
 
 ## 香橙派分模块验收
 
-主机常规与外接专项分开执行、筛选和统计。默认只读识别当前生效配置，也可选择 EGO / UMI / DEX；各自使用独立的连接、标定和录制数据契约，不自动切换设备槽位或写标定。当前一轮含主机20项及所选外接16项，未测/待确认不计通过。
+在仓库根目录运行以下命令即可自动识别单设备或 EGO Plus + DEX 联动组合，完成主机与外设巡检并执行一次真实短采集。把 IP 换成当前设备地址。去掉 `--record` 可执行只读巡检。
+
+```powershell
+.\.venv-gui\Scripts\python.exe orangepi_inspection.py --host 192.168.24.83 --record
+```
 
 EGO检查USB相机/IMU及对应标定载体；UMI检查手侧串口、配置的相机/VIVE和每手标定；DEX检查手侧串口、近手相机、每手URDF及关节/触觉遥测。短采集和上传为独立勾选项，文件保留，上传类别按设备区分。详见[香橙派验收说明](docs/香橙派巡检.md)。

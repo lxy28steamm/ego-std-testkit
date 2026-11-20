@@ -107,7 +107,7 @@ class OrangePiPanel(QWidget):
         connection_group=QGroupBox('连接与测试模块')
         connection_group.setLayout(form)
         root.addWidget(connection_group)
-        self.profile_hint=QLabel('自动识别：从设备端生效配置加载专项；联动实采请选择 EGO Plus + DEX 联动采集。')
+        self.profile_hint=QLabel()
         self.profile_hint.setWordWrap(True)
         root.addWidget(self.profile_hint)
         self.login_test=QCheckBox('执行正反向登录测试（仅同一测试账号，会重新登录）')
@@ -204,11 +204,15 @@ class OrangePiPanel(QWidget):
         for column in (1,3):
             self.table.horizontalHeader().setSectionResizeMode(column,QHeaderView.Stretch)
         root.addWidget(self.table,1)
+        self._sync_modules()
 
     def _sync_modules(self):
         from orangepi_profiles import GUIDES
         family=self.device.currentData()
-        self.profile_hint.setText(GUIDES.get(family,'自动识别生效配置；多设备联动时请选择具体专项。不会自动修改设备连接或标定。'))
+        hint='自动读取已启用的设备：支持单设备，以及 EGO Plus 与 DEX 两台联动。'
+        if family=='linked':
+            hint='联动专项要求设备端仅启用 EGO Plus 和 DEX，并分别核验双方的数据流。'
+        self.profile_hint.setText(GUIDES.get(family,hint))
         host_only=self.test_scope.currentData()=='host'
         peripheral_only=self.test_scope.currentData()=='peripheral'
         self.device.setEnabled(not host_only)

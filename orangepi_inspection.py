@@ -5,6 +5,7 @@ from datetime import datetime
 import getpass
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import socket
@@ -318,28 +319,46 @@ def inspect(config,password='',key_file='',cancel=None,on_update=lambda session:
     return session
 
 
-if __name__=='__main__':
-    p=argparse.ArgumentParser(description='Read-only Orange Pi inspection')
-    p.add_argument('--device',choices=('auto','ego','umi','dex','system'),default='auto')
+def main(argv=None):
+    p=argparse.ArgumentParser(description='香橙派巡检；默认只读，使用 --record 自动执行短采集回归')
+    p.add_argument('--device',choices=('auto','ego','umi','dex','linked','system'),default='auto')
     p.add_argument('--scope',choices=('all','host','peripheral'),default='all')
     p.add_argument('--api-port',type=int,default=18000)
-    p.add_argument('--host',required=True)
+    p.add_argument('--host',default=os.environ.get('ORANGEPI_HOST'),help='目标 IP 或主机名，也可设置 ORANGEPI_HOST')
+    p.add_argument('--record',action='store_true',help='自动执行短采集、预览、停止和本轮 MCAP 校验')
+    p.add_argument('--record-seconds',type=int,metavar='10-60',help='短采集时长，默认 15 秒，需同时使用 --record')
     p.add_argument('--user',default='orangepi')
     p.add_argument('--port',type=int,default=22)
     p.add_argument('--services',default='ssh.service')
     p.add_argument('--key-file',default='')
     p.add_argument('--trust-fingerprint',default='')
     p.add_argument('--password',action='store_true',help='Prompt for password; never pass it as an argument')
-    a=p.parse_args()
-    cfg=settings(a.host,a.user,a.port,a.services,trusted=a.trust_fingerprint)
+    a=p.parse_args(argv)
+    if not a.host:
+        p.error('请用 --host 或 ORANGEPI_HOST 指定目标设备')
+    if a.record and (a.device=='system' or a.scope=='host'):
+        p.error('--record 需要外设巡检模式')
+    if a.record_seconds is not None and (not a.record or not 10<=a.record_seconds<=60):
+        p.error('--record-seconds 需要启用 --record，且时长为 10～60 秒')
+    try:
+        cfg=settings(a.host,a.user,a.port,a.services,trusted=a.trust_fingerprint)
+    except ValueError as exc:
+        p.error(str(exc))
     if not 1<=a.api_port<=65535:
         p.error('API端口范围为1～65535')
     if a.device!='system':
-        cfg.update(acceptance=a.device,api_port=a.api_port,framework_v2=True,test_scope=a.scope)
+        cfg.update(acceptance=a.device,api_port=a.api_port,framework_v2=True,test_scope=a.scope,
+                   test_record=a.record,capture_preview=a.record,record_seconds=a.record_seconds or 15)
     try:
-        result=inspect(cfg,getpass.getpass('SSH password: ') if a.password else '',a.key_file)
-        print(json.dumps({'state':result['state'],'counts':result['counts'],'report':result['report']},ensure_ascii=False))
-        raise SystemExit(1 if result['state'] in ('检查失败','检查未完成') else 0)
+        password=getpass.getpass('SSH password: ') if a.password and a.device=='system' else ''
+        result=inspect(cfg,password,a.key_file)
+        summary={k:result[k] for k in ('state','counts','report','error','device_profile','functional') if k in result}
+        print(json.dumps(summary,ensure_ascii=False))
+        return 1 if result['state'] in ('检查失败','检查未完成','已停止') else 0
     except UnknownHostKey as exc:
         print(str(exc))
-        raise SystemExit(2)
+        return 2
+
+
+if __name__=='__main__':
+    raise SystemExit(main())

@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import threading
 import time
+import urllib.error
 import urllib.request
 import urllib.parse
 from uuid import uuid4
@@ -45,14 +46,42 @@ def validate_mcap(path):
             first.setdefault(topic,message.log_time)
             if topic in last and message.log_time<last[topic]: regressions[topic]=regressions.get(topic,0)+1
             last[topic]=message.log_time
-        if not topics or any(regressions.values()): raise ValueError('消息为空或流内时间戳倒退')
+        if not topics:
+            raise ValueError('MCAP 没有消息')
+        if regressions:
+            detail='、'.join(f'{topic}（{count} 次）' for topic,count in sorted(regressions.items()))
+            raise ValueError('MCAP 流内时间戳倒退：'+detail)
         if sum(topics.values())!=summary.statistics.message_count: raise ValueError('实际消息数与汇总不一致')
+        metadata_names=[]
+        stream_mapping={}
+        for entry in reader.iter_metadata():
+            metadata_names.append(entry.name)
+            if entry.name=='common.stream_mapping':
+                for source, topic in entry.metadata.items():
+                    if source in stream_mapping and stream_mapping[source]!=topic:
+                        raise ValueError('MCAP 数据流映射冲突：'+source)
+                    stream_mapping[source]=topic
         return {'message_count':sum(topics.values()),'topics':topics,'regressions':regressions,
                 'durations':{k:(last[k]-first[k])/1e9 for k in topics},'size_bytes':path.stat().st_size,
                 'channels':[{'topic':c.topic,'encoding':c.message_encoding} for c in summary.channels.values()],
                 'schemas':[s.name for s in summary.schemas.values()],
                 'attachments':[{'name':a.name,'media_type':a.media_type} for a in reader.iter_attachments()],
-                'metadata_names':[m.name for m in reader.iter_metadata()]}
+                'metadata_names':metadata_names,'stream_mapping':stream_mapping}
+
+
+def capture_preview(api,folder,phase):
+    try:
+        with api.opener.open(api.base+'/api/v2/preview/snapshot.jpg',timeout=15) as response:
+            image=response.read(16*1024**2)
+        if not image.startswith(b'\xff\xd8') or not image.endswith(b'\xff\xd9'):
+            raise ValueError('预览未返回完整 JPEG')
+        (folder/'umi-preview.jpg').write_bytes(image)
+        return '通过',phase+'当前预览流返回 JPEG；其他相机及物理屏幕显示仍需核验'
+    except urllib.error.HTTPError as exc:
+        reason={404:'未获得首帧或预览流不存在',409:'当前状态或策略限制预览'}.get(exc.code,exc.reason)
+        return '未测',f'{phase}当前预览流 HTTP {exc.code}：{reason}'
+    except Exception as exc:
+        return '未测',f'{phase}当前预览流未验证：{type(exc).__name__}：{exc}'
 
 
 def run(config,folder,cancel=None,log=lambda text:None):
@@ -65,6 +94,11 @@ def run(config,folder,cancel=None,log=lambda text:None):
     def save(): (folder/'functional.json').write_text(json.dumps(evidence,ensure_ascii=False,indent=2),encoding='utf-8')
     def emit(key,status,detail):
         evidence['steps'].append(dict(id='ACC-'+key,status=status,detail=detail));save();log(detail)
+    def inspect_preview(phase):
+        status,detail=capture_preview(api,folder,phase)
+        if status=='通过':
+            evidence['preview']='umi-preview.jpg'
+        emit('preview',status,detail)
     def check():
         if cancel.is_set(): raise RuntimeError('验收已取消')
     def stop_owned():
@@ -115,6 +149,8 @@ def run(config,folder,cancel=None,log=lambda text:None):
         emit('serial','通过',family.upper()+'连接前置检查通过；专项数据由本轮文件继续验证')
         previous=api.call('/api/v2/collection-task');evidence['previous_task']={k:previous.get(k) for k in ('name','source')}
         if previous.get('source')=='assigned': raise RuntimeError('当前为分配任务，不能自动切到本地验收任务，请先在设备端切到测试任务')
+        if config.get('capture_preview') and profile.get('linked_slots'):
+            inspect_preview('联动录制前')
         created=api.call('/api/v2/collection-task',{'name':name},method='POST');task_changed=True
         actual_task=created.get('storage_name') or created.get('name') or name
         evidence['actual_task']=actual_task
@@ -141,15 +177,8 @@ def run(config,folder,cancel=None,log=lambda text:None):
             if started.get('session_id')!=owned: raise RuntimeError('会话发生变化')
         seconds=int(config.get('record_seconds',15));deadline=time.monotonic()+seconds
         samples=[]
-        if config.get('capture_preview'):
-            try:
-                with api.opener.open(api.base+'/api/v2/preview/snapshot.jpg',timeout=15) as response:
-                    image=response.read(16*1024**2)
-                if not image.startswith(b'\xff\xd8'): raise ValueError('不是 JPEG')
-                (folder/'umi-preview.jpg').write_bytes(image)
-                evidence['preview']='umi-preview.jpg'
-                emit('preview','通过','本轮录制期间预览接口返回 JPEG；物理屏幕显示需现场确认')
-            except Exception as exc: emit('preview','未测','预览未验证：'+type(exc).__name__)
+        if config.get('capture_preview') and not profile.get('linked_slots'):
+            inspect_preview('单设备录制期间')
         while time.monotonic()<deadline:
             check();state=api.call('/api/v2/session')
             if profile.get('linked_slots'):
@@ -228,9 +257,7 @@ def run(config,folder,cancel=None,log=lambda text:None):
         from orangepi_profiles import file_contract
         data_status,data_detail=file_contract(profile,evidence['mcap'])
         if profile.get('linked_slots'):
-            missing_topics=[t for t in linked_required_topics(hands,bindings) if (evidence['mcap'].get('topics') or {}).get(t,0)<=0]
-            data_status='失败' if missing_topics else data_status
-            data_detail+='；联动文件缺失流='+str(missing_topics)+'；容器检查不代表跨设备严格同步。'
+            data_status,data_detail=linked_file_contract(linked_required_topics(hands,bindings),evidence['mcap'])
         emit('data_layout',data_status,data_detail)
         emit('record','通过','本轮短采集及停止完成；MCAP 尾部、CRC（若存在）、实际消息数及流内时间戳检查通过；文件='+local.name)
         if config.get('test_upload'):
@@ -271,7 +298,7 @@ def run(config,folder,cancel=None,log=lambda text:None):
     except Exception as exc:
         evidence['error']=type(exc).__name__+': '+str(exc);save();log(evidence['error'])
         failed_key='upload' if any(s['id']=='ACC-record' and s['status']=='通过' for s in evidence['steps']) else 'record'
-        emit(failed_key,'未测' if cancel.is_set() or isinstance(exc,ButtonSessionChanged) else '失败','流程未完成：'+type(exc).__name__+'；详见 functional.json')
+        emit(failed_key,'未测' if cancel.is_set() or isinstance(exc,ButtonSessionChanged) else '失败','流程未完成：'+evidence['error']+'；详见 functional.json')
     finally:
         if owned:
             try:
@@ -302,3 +329,23 @@ def run(config,folder,cancel=None,log=lambda text:None):
 def linked_required_topics(hands,bindings=None):
     cameras=['/devices/dex/cameras/'+hand+'/video' for hand in hands if (bindings or {}).get(hand+'_camera')]
     return cameras + ['/devices/ego-plus/cameras/'+side+'/video' for side in ('left','right')] + ['/devices/ego-plus/imu'] + ['/devices/dex/hands/'+hand+'/state' for hand in hands]
+
+
+def linked_file_contract(required_topics,mcap):
+    """Match each required device stream to a distinct channel carrying messages."""
+    counts=mcap.get('topics') or {}
+    mapping=mcap.get('stream_mapping') or {}
+    matched={}
+    issues=[]
+    for source in required_topics:
+        for target in mapping.get(source,source).split(','):
+            topic=target.strip()
+            if counts.get(topic,0)<=0:
+                issues.append(f'{source} 对应的 {topic} 无消息')
+            elif topic in matched:
+                issues.append(f'{source} 与 {matched[topic]} 同时映射到 {topic}')
+            else:
+                matched[topic]=source
+    if issues:
+        return '失败','；'.join(issues)
+    return '通过',f'联动 MCAP 已逐路核对 {len(matched)} 个独立数据流及实际消息数；跨设备时间同步精度仍需单独验证。'

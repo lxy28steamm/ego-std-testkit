@@ -10,10 +10,12 @@ def resolve(health,requested='auto'):
     selection=health.get('selection') or {}
     enabled=selection.get('enabled_devices')
     if enabled is None:enabled=[k for k,v in (health.get('devices') or {}).items() if v.get('active')]
-    enabled=[x for x in enabled if x in FAMILIES]
-    if requested == 'linked':
+    if requested == 'linked' or requested == 'auto' and set(enabled) == {'ego-plus', 'dex'}:
         if set(enabled) != {'ego-plus', 'dex'}: raise ValueError('联动测试要求仅启用 EGO Plus 和 DEX')
         return {'family':'dex','slot':'dex','linked_slots':['ego-plus','dex'],'guide':'EGO Plus + DEX 联动采集；双方数据独立核验'}
+    if requested == 'auto' and any(slot not in FAMILIES for slot in enabled):
+        raise ValueError('启用配置包含未支持的槽位：'+str(enabled))
+    enabled=[x for x in enabled if x in FAMILIES]
     candidates=[x for x in enabled if requested=='auto' or requested==x or FAMILIES[x]==requested]
     if len(candidates)!=1:raise ValueError('不能唯一确定外接设备，请核对设备端已启用配置并明确选择专项；当前='+str(enabled))
     slot=candidates[0];return {'family':FAMILIES[slot],'slot':slot,'guide':GUIDES[FAMILIES[slot]]}
