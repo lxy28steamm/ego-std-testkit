@@ -4,6 +4,7 @@ import pytest
 
 PREFIX = '@@APP_PATROL@@'
 NAMES = {
+    'test_selected_account_login': '测试账号登录与任务页回读',
     'test_usb_camera_empty_scan': 'USB 相机无设备扫描提示',
     'test_guest_empty_login': '游客空登录校验',
     'test_guest_task_center': '游客任务页与登录提示',
@@ -45,6 +46,10 @@ def case(item):
 
 def pytest_collection_finish(session):
     emit('collected', cases=[case(item) for item in session.items])
+
+
+def pytest_runtest_logstart(nodeid, location):
+    emit('case_started', id=nodeid)
 
 
 @pytest.hookimpl(hookwrapper=True)

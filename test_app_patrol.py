@@ -122,6 +122,7 @@ class PatrolTests(unittest.TestCase):
         self.assertIsNotNone(panel.session)
         self.assertEqual('已完成', panel.session['state'])
         self.assertEqual({'通过': 3}, panel.session['counts'])
+        self.assertEqual('缺少APP配置时拦截', panel.session['activity']['case'])
         self.assertEqual(3, panel.table.rowCount())
         self.assertTrue(Path(panel.session['report']).is_file())
         self.assertTrue((Path(panel.session['folder']) / 'junit.xml').is_file())

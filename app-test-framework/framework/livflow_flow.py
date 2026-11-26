@@ -1,4 +1,4 @@
-"""Guarded LivFlow workflows. Never accepts credentials or upgrades firmware."""
+"""Guarded LivFlow workflows."""
 from __future__ import annotations
 from contextlib import contextmanager
 import hashlib
@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shlex
 import subprocess
 import time
 import uuid
@@ -69,7 +70,7 @@ def configuration(path):
     for key, low, high in [('record_seconds', 5, 120), ('background_seconds', 0, 30),
                             ('human_timeout', 10, 3600), ('wait_timeout', 5, 300)]:
         values[key] = int(values.get(key, {'record_seconds':15, 'background_seconds':5,
-                                          'human_timeout':900, 'wait_timeout':90}[key]))
+                                          'human_timeout':240, 'wait_timeout':90}[key]))
         if not low <= values[key] <= high:
             raise ValueError(f'{key} 必须在 {low}～{high} 范围内')
     return values
@@ -103,8 +104,8 @@ class UI:
     # 这些都不是"手机没解锁"，以前一失败就 RuntimeError，整条用例直接判失败、丢失真实结论。
     _DUMP_RETRY_MARKERS = (b'could not get idle state', b'ERROR:', b'Killed',
                            b'null root node', b'Access denied')
-    _DUMP_ATTEMPTS = 6
-    _DUMP_SPACING = (0.3, 0.6, 1.0, 1.5, 2.0)
+    _DUMP_ATTEMPTS = 3
+    _DUMP_SPACING = (0.3, 0.6, 1.0)
     _ocr_fallback = False
 
     def _dump_once(self, timeout):
@@ -147,7 +148,7 @@ class UI:
         for attempt in range(self._DUMP_ATTEMPTS):
             self.check_cancel()
             try:
-                return self._dump_once(20)
+                return self._dump_once(10)
             except subprocess.TimeoutExpired:
                 last = 'dump 超时'
             except subprocess.CalledProcessError as exc:
@@ -176,7 +177,7 @@ class UI:
         return '\n'.join(self.label(n) for n in self.tree().iter('node'))
 
     def find(self, label=None, contains=False, class_name=None, tree=None, resource_id=None,
-             container=None):
+             container=None, password_field=None):
         tree = tree if tree is not None else self.tree()
         tops = [list(map(int,re.findall(r'-?\d+',n.get('bounds','')))) for n in list(tree)]
         screen_right = max((b[2] for b in tops if len(b)==4),default=0)
@@ -189,6 +190,8 @@ class UI:
         candidates=[]
         for node in tree.iter('node'):
             if node.get('enabled')=='false' or node.get('visible-to-user')=='false':continue
+            if password_field is not None and (node.get('password') == 'true') != password_field:
+                continue
             if resource_id and node.get('resource-id')!=resource_id:continue
             text = self.label(node)
             if class_name and node.get('class') != class_name:
@@ -275,7 +278,8 @@ class UI:
         self.last_state=state
         return tree,state,fingerprint(tree)
 
-    def tap(self, label=None, *, contains=False, class_name=None, resource_id=None, container=None):
+    def tap(self, label=None, *, contains=False, class_name=None, resource_id=None, container=None,
+            password_field=None):
         deadline=time.monotonic()+10
         last_dup=None
         with self.budget(10):
@@ -284,7 +288,8 @@ class UI:
                 tree,state,signature=self.snapshot()
                 try:
                     found=self.find(label,contains=contains,class_name=class_name,
-                                    resource_id=resource_id,tree=tree,container=container)
+                                    resource_id=resource_id,tree=tree,container=container,
+                                    **({'password_field': password_field} if password_field is not None else {}))
                 except DuplicateControl as exc:
                     # 分不清就等一拍，再读一次；两次都分不清才报，避免一次抖动判死。
                     last_dup=exc
@@ -295,7 +300,8 @@ class UI:
                     fresh,new_state,_=self.snapshot()
                     try:
                         again=self.find(label,contains=contains,class_name=class_name,
-                                        resource_id=resource_id,tree=fresh,container=container)
+                                        resource_id=resource_id,tree=fresh,container=container,
+                                        **({'password_field': password_field} if password_field is not None else {}))
                     except DuplicateControl as exc:
                         last_dup=exc
                         again=None
@@ -341,6 +347,15 @@ class UI:
         if re.search(r'(?:mInputShown|inputShown|isInputViewShown)\s*=\s*true',info):
             self.adb('shell','input','keyevent','4')
 
+    def enter_login_value(self, value, *, password_field):
+        self.tap(class_name='android.widget.EditText', password_field=password_field)
+        self.check_cancel()
+        command = 'input text ' + shlex.quote(value) + '\n'
+        result = subprocess.run(['adb', '-s', self.serial, 'shell', '-T', 'sh'],
+                                input=command.encode('ascii'), capture_output=True, timeout=15)
+        if result.returncode:
+            raise RuntimeError('ADB 登录字段输入失败')
+
     def swipe(self, up=True):
         root = self.tree()
         bounds = list(map(int, re.findall(r'\d+', next(root.iter('node')).get('bounds', ''))))
@@ -355,9 +370,11 @@ class UI:
             self.swipe(up)
         raise AssertionError(f'滚动后仍未找到：{label}')
 
-    def wait(self, condition, timeout=30, message='页面未达到预期状态'):
+    def wait(self, condition, timeout=30, message='页面未达到预期状态', *, tree_check=None):
         deadline=time.monotonic()+timeout;last=None;unchanged_since=time.monotonic()
         dump_count=0
+        condition_label = '等待目标页面或控件' if message == '页面未达到预期状态' else message
+        event('activity', details={'condition': f'{condition_label}（最多 {timeout} 秒）'})
         with self.budget(timeout):
             while time.monotonic()<deadline:
                 self.check_cancel()
@@ -367,10 +384,13 @@ class UI:
                 except UiReadBudgetExhausted:
                     break
                 text='\n'.join(self.label(n) for n in root.iter('node'))
-                if condition(text):return text
+                if condition(text) and (tree_check is None or tree_check(root)):
+                    event('activity', details={'condition': '', 'page': NAMES[state], 'feedback': '已读到预期界面状态'})
+                    return text
                 key=(state,signature)
                 if key!=last:
                     event('step',message='页面状态：'+NAMES[state])
+                    event('activity', details={'page': NAMES[state]})
                     last=key;unchanged_since=time.monotonic()
                 elif state=='unknown' and time.monotonic()-unchanged_since>=min(12,timeout):
                     raise AssertionError(message+'；页面未识别且持续无变化，已停止重复等待')
@@ -454,15 +474,21 @@ class Flow:
         gate = uuid.uuid4().hex
         resume = self.output/'resume.json'
         event('waiting', gate=gate, message=message)
+        event('activity', details={'condition': '', 'feedback': '正在回读手机状态' if ready else '等待你点击「已完成，继续」'})
         deadline = time.monotonic() + self.config['human_timeout']
         next_check = 0.0
         ready_count = 0
+        read_failures = 0
+        previous_feedback = ''
+        resumed_normally = False
         try:
             while time.monotonic() < deadline:
                 self.check_cancel()
                 if resume.exists():
                     try:
                         if json.loads(resume.read_text(encoding='utf-8')).get('gate') == gate:
+                            event('activity', details={'feedback': '已收到继续确认，开始后续检查'})
+                            resumed_normally = True
                             return
                     except (OSError, ValueError):
                         pass
@@ -472,25 +498,140 @@ class Flow:
                     next_check = time.monotonic() + 2.0
                     try:
                         ready_count = ready_count + 1 if ready() else 0
+                        read_failures = 0
                     except Cancelled:
                         raise
-                    except Exception:
+                    except Exception as exc:
                         ready_count = 0
+                        read_failures += 1
+                        # 界面连续读不到时不要再空等整个 human_timeout，
+                        # 直接带原因失败，避免把执行锁和外部流程一起拖死。
+                        if read_failures >= 3:
+                            reason = '连续 3 次无法读取手机界面：%s' % exc
+                            event('activity', details={'feedback': reason})
+                            raise RuntimeError(reason) from exc
+                    feedback = {0: '尚未读到所需状态', 1: '已读到所需状态，正在复核', 2: '已连续两次读到所需状态，自动继续'}
+                    if feedback[ready_count] != previous_feedback:
+                        previous_feedback = feedback[ready_count]
+                        event('activity', details={'feedback': previous_feedback})
                     if ready_count >= 2:
                         self.note('已连续确认所需状态，自动继续')
+                        resumed_normally = True
                         return
                 time.sleep(.2)
-            raise AssertionError('等待人工操作超时：' + message)
+            reason = '等待人工操作超时：' + message
+            event('activity', details={'feedback': reason})
+            raise AssertionError(reason)
         finally:
-            event('resumed', gate=gate)
+            # 只有真正等到继续确认才发 resumed；超时/取消/异常时发 gate_closed，
+            # 否则 GUI 会把"等待人工操作"误清成"运行中"，状态机错乱。
+            event('resumed' if resumed_normally else 'gate_closed',
+                  gate=gate, reason='' if resumed_normally else '门控未获确认即结束')
 
     def home_is_visible(self):
         root = self.ui.tree()
         return bool(self.ui.find('任务', tree=root) and self.ui.find('我的', tree=root))
 
+    def confirm_login_agreement(self):
+        def checkbox(root):
+            nodes = list(root.iter('node'))
+            if not any('隐私' in UI.label(node) for node in nodes):
+                return None
+            checks = [node for node in nodes if node.get('checkable') == 'true'
+                      and node.get('enabled') != 'false' and node.get('visible-to-user') != 'false']
+            named = [node for node in checks if '隐私' in UI.label(node) or '协议' in UI.label(node)]
+            candidates = named or checks
+            if len(candidates) != 1:
+                raise AssertionError('无法唯一识别登录页的隐私协议复选框，请在手机确认')
+            return candidates[0]
+
+        control = checkbox(self.ui.tree())
+        if control is None or control.get('checked') == 'true':
+            return
+        label, resource_id = UI.label(control), control.get('resource-id')
+        self.ui.tap(label or None, resource_id=resource_id or None, class_name=control.get('class'))
+
+        def checked(root):
+            current = checkbox(root)
+            return current is not None and current.get('checked') == 'true'
+
+        self.ui.wait(lambda text: True, timeout=10, tree_check=checked,
+                     message='等待隐私协议勾选确认')
+        self.note('已回读确认隐私协议已勾选')
+
+    def sign_in(self, *, require_automatic=False):
+        phone = os.environ.get('LIVFLOW_TEST_PHONE', '')
+        password = os.environ.get('LIVFLOW_TEST_PASSWORD', '')
+        role = os.environ.get('LIVFLOW_TEST_ROLE', '').strip()
+        if re.fullmatch(r'[0-9]+', phone) and re.fullmatch(r'[!-~]+', password) and '%s' not in password:
+            self.note('正在通过 LivFlow 登录表单提交测试账号')
+            try:
+                root = self.ui.tree()
+                fields = [node for node in root.iter('node') if node.get('class') == 'android.widget.EditText']
+                if len(fields) != 2 or any(node.get('text') for node in fields):
+                    raise RuntimeError('需要两个空输入框')
+                self.ui.enter_login_value(phone, password_field=False)
+                self.ui.enter_login_value(password, password_field=True)
+                self.ui.hide_keyboard()
+                self.confirm_login_agreement()
+                self.ui.tap('登录' if self.ui.find('登录') else '登录并继续上传')
+                text = self.ui.wait(lambda value: (
+                    all(label in value.splitlines() for label in ('任务', '我的'))
+                    or bool(role and role in value.splitlines())
+                ), timeout=20, message='等待登录后主页或配置的身份')
+                if role and role in text.splitlines() and not self.home_is_visible():
+                    self.ui.tap(role)
+                    if self.ui.find('确认'):
+                        self.ui.tap('确认')
+                    self.ui.wait(lambda value: all(label in value.splitlines() for label in ('任务', '我的')),
+                                 timeout=20, message='等待选择身份后进入主页')
+                self.note('已读到登录后主页，继续验证任务页')
+                return
+            except Cancelled:
+                raise
+            except (AssertionError, RuntimeError, subprocess.SubprocessError) as exc:
+                self.note('自动登录未确认，请查看手机登录结果或身份选择页')
+                if require_automatic:
+                    if isinstance(exc, AssertionError) and '隐私协议' in str(exc):
+                        raise
+                    raise AssertionError('未确认自动登录成功。请检查所选账号、密码、登录身份和手机页面。') from None
+        if require_automatic:
+            raise AssertionError('未确认自动登录成功。请检查所选账号、密码、登录身份和手机页面。')
+        self.pause('请在手机完成测试账号登录及身份选择，返回主页后自动继续。', ready=self.home_is_visible)
+
     def stereo_preview_is_visible(self):
         text = self.ui.text()
         return all(label in text for label in ('视频预览', '左目 ·', '右目 ·'))
+
+    def prepare_login_form(self):
+        if '欢迎登录' in self.ui.text():
+            return
+        self.home()
+        self.ui.tap('任务')
+        task_page = self.ui.wait(lambda text: '任务中心' in text)
+        if '请先登录' not in task_page:
+            self.note('检测到已有登录态，先退出账号，再校验登录页面')
+            self.ui.tap('我的')
+            if self.ui.find('退出登录'):
+                self.ui.tap('退出登录')
+            if self.ui.find('确认退出'):
+                self.ui.tap('确认退出')
+            if not self.login_or_guest_is_visible():
+                self.pause(
+                    '请在 LivFlow「我的」退出当前账号并确认，停在登录页或返回游客主页。',
+                    ready=self.login_or_guest_is_visible,
+                )
+        if '欢迎登录' not in self.ui.text():
+            self.ui.tap('任务')
+            self.ui.wait(lambda text: '任务中心' in text and '请先登录' in text,
+                         message='等待退出后的游客任务页')
+            self.ui.tap('登录')
+        self.ui.wait(lambda text: '欢迎登录' in text, message='等待登录表单')
+
+    def login_or_guest_is_visible(self):
+        text = self.ui.text()
+        return '欢迎登录' in text or '未登录' in text or (
+            '任务中心' in text and '请先登录' in text)
 
     def home(self):
         self.ui.adb('shell', 'am', 'start', '-W', '-n', PACKAGE+'/.MainActivity')
@@ -508,7 +649,7 @@ class Flow:
                 self.pause('APP 底部导航被系统栏遮挡。请确认没有正在采集或上传后重新打开 APP，回到主页再继续。')
                 continue
             if self.ui.find('欢迎登录', tree=root):
-                self.pause('请在手机直接登录测试账号并选择身份；进入 APP 主页后会自动继续。不要在工作台输入密码。', ready=self.home_is_visible)
+                self.sign_in()
                 continue
             if self.ui.find('返回', tree=root):
                 self.ui.tap('返回')
@@ -521,7 +662,9 @@ class Flow:
         self.ui.tap('任务')
         text = self.ui.wait(lambda x: '任务中心' in x)
         if '请先登录' in text:
-            self.pause('请点击手机任务页的登录，完成测试账号登录后继续。')
+            self.ui.tap('登录')
+            self.ui.wait(lambda value: '欢迎登录' in value, message='等待登录表单')
+            self.sign_in()
             self.home()
             self.ui.tap('任务')
         return self.ui.wait(lambda x: '任务中心' in x and '请先登录' not in x)
@@ -531,8 +674,7 @@ class Flow:
         if not task:
             raise AssertionError('请先在“流程配置”填写本轮测试任务编号，不能自动选择任意任务')
         self.tasks()
-        if self.ui.find('清空搜索'):
-            self.ui.tap('清空搜索')
+        self.clear_task_search()
         self.ui.tap(class_name='android.widget.EditText')
         self.ui.adb('shell', 'input', 'text', task)
         self.ui.hide_keyboard()
@@ -541,19 +683,42 @@ class Flow:
         assert task+'\n' in text
         return task
 
-    def search_reset(self):
-        self.target_task()
-        self.capture('task_search')
-        self.ui.tap('清空搜索')
-        self.ui.hide_keyboard()
-        text = self.ui.wait(lambda x: '任务中心' in x and re.search(r'共\s*\d+\s*个任务',x))
+    def clear_task_search(self):
         field = self.ui.find(class_name='android.widget.EditText')
-        assert field and task_list_is_restored(text,field[0].get('text','')), '清空搜索后任务列表或输入框未恢复'
+        assert field, '任务搜索框不可见，无法核对搜索词'
+        value = field[0].get('text', '')
+        clear_button = self.ui.find('清空搜索')
+        if clear_button:
+            self.ui.tap('清空搜索')
+        elif value.strip():
+            self.ui.tap(class_name='android.widget.EditText')
+            self.ui.adb('shell', 'input', 'keyevent', 'KEYCODE_MOVE_END', *(['KEYCODE_DEL'] * len(value)))
+        self.ui.hide_keyboard()
+        if not clear_button and value.strip() and self.ui.find('搜索'):
+            self.ui.tap('搜索')
+
+        def search_is_empty(root):
+            current = self.ui.find(class_name='android.widget.EditText', tree=root)
+            return bool(current and not current[0].get('text', '').strip())
+
+        self.ui.wait(lambda text: task_list_is_restored(text, ''), tree_check=search_is_empty,
+                     message='等待搜索框清空并恢复任务列表')
+
+    def search_reset(self):
+        try:
+            self.target_task()
+            self.capture('task_search')
+        except (AssertionError, Cancelled):
+            with self.cleanup():
+                if '任务中心' in self.ui.text():
+                    self.clear_task_search()
+            raise
+        self.clear_task_search()
         self.capture('task_search_reset')
 
     def filters(self):
         self.tasks()
-        self.ui.hide_keyboard()
+        self.clear_task_search()
         self.ui.tap('状态, 筛选状态\n状态')
         self.ui.wait(lambda x: '全部状态' in x)
         self.ui.tap('待开始')

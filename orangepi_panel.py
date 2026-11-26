@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 import threading
 
+from patrol_account_picker import PatrolAccountPicker
+
 from PySide6.QtCore import QThread, Signal, Qt, QUrl
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QLineEdit,QSpinBox,
@@ -111,11 +113,7 @@ class OrangePiPanel(QWidget):
         self.profile_hint.setWordWrap(True)
         root.addWidget(self.profile_hint)
         self.login_test=QCheckBox('执行正反向登录测试（仅同一测试账号，会重新登录）')
-        self.cloud_account=QLineEdit()
-        self.cloud_password=QLineEdit()
-        self.cloud_password.setEchoMode(QLineEdit.Password)
-        self.cloud_account.setPlaceholderText('专用测试账号；不写入报告')
-        self.cloud_password.setPlaceholderText('仅本轮使用，不保存')
+        self.login_accounts = PatrolAccountPicker('orangepi', self)
         self.record_test=QCheckBox('执行本轮短采集和 MCAP 校验（新增测试数据）')
         self.button_test=QCheckBox('配合本设备按键测试（建议 60 秒，允许提前停录）')
         self.upload_test=QCheckBox('上传本轮测试数据（保留本地文件）')
@@ -128,8 +126,7 @@ class OrangePiPanel(QWidget):
         test_form=QFormLayout()
         login_form=QFormLayout()
         login_form.addRow(self.login_test)
-        login_form.addRow('测试云账号',self.cloud_account)
-        login_form.addRow('测试云密码',self.cloud_password)
+        login_form.addRow('本机测试账号', self.login_accounts)
         login_group=QGroupBox('主机常规 · 账号专项（可选）')
         login_group.setLayout(login_form)
         root.addWidget(login_group)
@@ -241,7 +238,7 @@ class OrangePiPanel(QWidget):
 
     def controls(self,busy):
         for widget in (self.start,self.host,self.port,self.username,self.password,self.key_file,self.services,
-                       self.temperature,self.disk,self.memory,self.cpu,self.history,self.test_scope,self.device,self.rules_file,self.api_port,self.login_test,self.cloud_account,self.cloud_password,self.record_test,self.button_test,self.upload_test,self.record_seconds,self.assigned_task):
+                       self.temperature,self.disk,self.memory,self.cpu,self.history,self.test_scope,self.device,self.rules_file,self.api_port,self.login_test,self.login_accounts,self.record_test,self.button_test,self.upload_test,self.record_seconds,self.assigned_task):
             widget.setEnabled(not busy)
         self.stop.setEnabled(busy)
         if not busy:self._sync_modules()
@@ -265,10 +262,14 @@ class OrangePiPanel(QWidget):
             config['acceptance']=self.device.currentData()
             config['api_port']=self.api_port.value()
             config['test_login']=self.login_test.isChecked()
-            config['login_account']=self.cloud_account.text().strip()
-            config['login_password']=self.cloud_password.text()
-            if config['test_login'] and (not config['login_account'] or not config['login_password']):
-                raise ValueError('登录测试需填写专用账号和密码')
+            if config['test_login']:
+                try:
+                    account = self.login_accounts.selected_account()
+                except (OSError, ValueError) as exc:
+                    raise ValueError('无法读取本机测试账号列表') from exc
+                if not account:
+                    raise ValueError('登录测试需选择专用测试账号')
+                config.update(login_account=account['PHONE'], login_password=account['PASSWORD'])
             config['test_record']=self.record_test.isChecked()
             config['test_upload']=self.upload_test.isChecked()
             config['record_seconds']=self.record_seconds.value()
@@ -323,7 +324,6 @@ class OrangePiPanel(QWidget):
                 self.start_run()
                 return
         self.password.clear()
-        self.cloud_password.clear()
         if self.session:
             self.render(self.session)
         else:

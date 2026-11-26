@@ -1,4 +1,4 @@
-"""Guest-mode checks: no account, logout, device connection, or agreement acceptance."""
+"""Guest checks with logout preparation for empty-login validation."""
 import os
 from pathlib import Path
 import pytest
@@ -32,9 +32,7 @@ def guest_tasks(flow):
 def test_guest_empty_login(guest_flow,request):
     flow=guest_flow
     flow.item=request.node
-    guest_tasks(flow)
-    flow.ui.tap('登录')
-    flow.ui.wait(lambda value:'欢迎登录' in value)
+    flow.prepare_login_form()
     # Entering the login form from the task page can open the software keyboard,
     # which otherwise obscures the submit button on landscape devices.
     flow.ui.hide_keyboard()

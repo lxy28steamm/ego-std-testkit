@@ -23,6 +23,7 @@ MODES = {
     'smoke': ('LivFlow 基础自动巡检', 'tests/test_livflow_adb.py'),
     'preview': ('LivFlow 预览只读检查', 'tests/test_livflow_open_wifi.py'),
     'flow_guest': ('游客模式与登录校验', 'tests/test_livflow_guest.py'),
+    'flow_login': ('测试账号登录', 'tests/test_livflow_login.py'),
     'flow_usb': ('USB 相机空设备扫描', 'tests/test_livflow_usb.py'),
     'flow_tasks': ('任务搜索、筛选与统计', 'tests/test_livflow_workflows.py'),
     'flow_filters': ('任务状态和时长筛选', 'tests/test_livflow_workflows.py'),
@@ -88,7 +89,10 @@ def manual_session(framework, catalogue_file='app_patrol_catalog.json', report_t
 @contextmanager
 def execution_lock():
     RUNS.mkdir(parents=True, exist_ok=True)
-    f = (RUNS / 'execution.lock').open('a+b')
+    try:
+        f = (RUNS / 'execution.lock').open('a+b')
+    except OSError:
+        raise RuntimeError('另一个工作台正在执行 APP 自动检查，请等待结束')
     if os.fstat(f.fileno()).st_size == 0:
         f.write(b'0')
         f.flush()
@@ -157,10 +161,10 @@ def run(mode, framework, serial, cancel_file, flow_config=None, allow_parameters
             args[3:3] = [str(root / 'tests/test_config.py'), str(root / 'tests/test_livflow_guest.py'),str(root / 'tests/test_livflow_usb.py')]
         if mode not in ('selfcheck','files'):
             args.append('--device')
-        if mode.startswith('flow_'):
+        if mode == 'smoke' or mode.startswith('flow_'):
             args.append('-s')
-            if mode not in ('flow_all','flow_full'):
-                args += ['-m',mode]
+        if mode.startswith('flow_') and mode not in ('flow_all','flow_full'):
+            args += ['-m',mode]
         env = os.environ.copy()
         env.update(PYTHONIOENCODING='utf-8', PYTHONUTF8='1', PYTHONUNBUFFERED='1',
                    ANDROID_UDID=serial, PYTHONPATH=str(BASE))
@@ -191,11 +195,14 @@ def run(mode, framework, serial, cancel_file, flow_config=None, allow_parameters
                 if cancel_file and Path(cancel_file).exists() and not cancelled:
                     cancelled = True
                     cancel_started = time.monotonic()
-                    if not mode.startswith('flow_'):
+                    # 卡在人工门控时，pytest 除了等 resume 什么也不做，强行等待只会拖 90 秒；
+                    # 此时直接结束子进程，由用户确认设备已退出采集/参数已恢复。
+                    if not mode.startswith('flow_') or (session.get('state') == '等待人工操作'):
+                        emit('log',message='检测到流程停在人工确认，立即停止本轮执行。请确认 EGO 已结束采集、参数已恢复。')
                         stop_child(proc)
                     else:
                         emit('log',message='已请求停止；正在等待流程结束采集或恢复参数。')
-                if cancelled and mode.startswith('flow_') and proc.poll() is None and time.monotonic()-cancel_started>90:
+                if cancelled and mode.startswith('flow_') and proc.poll() is None and time.monotonic()-cancel_started>15:
                     emit('log',message='流程未能及时结束，强制停止。请人工确认 EGO 已结束采集、参数已恢复。')
                     stop_child(proc)
                 try:
@@ -212,6 +219,9 @@ def run(mode, framework, serial, cancel_file, flow_config=None, allow_parameters
                         continue
                     if event['type'] == 'collected':
                         session['cases'] = event['cases']
+                    elif event['type'] == 'case_started':
+                        title = next((row['title'] for row in session['cases'] if row['id'] == event['id']), event['id'])
+                        session['activity'] = {'case': title}
                     elif event['type'] == 'case':
                         for row in session['cases']:
                             if row['id'] == event['case']['id']:
@@ -223,9 +233,16 @@ def run(mode, framework, serial, cancel_file, flow_config=None, allow_parameters
                     elif event['type'] == 'resumed':
                         session.pop('waiting',None)
                         session['state'] = '运行中'
+                    elif event['type'] == 'gate_closed':
+                        # 门控超时/取消时正常收尾，避免 GUI 永远停留在"等待人工操作"
+                        session.pop('waiting',None)
+                        session['state'] = '运行中'
+                        emit('log',message='人工确认已结束：'+event.get('reason',''))
                     elif event['type'] == 'step':
                         emit('log',message=event['message'])
                         continue
+                    elif event['type'] == 'activity':
+                        session.setdefault('activity', {}).update(event['details'])
                     write_session(session)
                     emit('update', session=session)
                 else:

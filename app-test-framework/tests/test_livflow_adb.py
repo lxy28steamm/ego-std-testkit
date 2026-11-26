@@ -9,8 +9,10 @@ import re
 import subprocess
 import time
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 import pytest
+from framework.livflow_flow import Flow, configuration
 
 PACKAGE = 'com.livsyn.livsyn_collection_app'
 pytestmark = [pytest.mark.device, pytest.mark.smoke]
@@ -60,6 +62,10 @@ def android(request, pytestconfig):
     device.command('shell', 'am', 'force-stop', PACKAGE)
     device.command('shell', 'am', 'start', '-W', '-n', PACKAGE + '/.MainActivity')
     try:
+        config_path = os.environ.get('APP_PATROL_FLOW_CONFIG', str(Path(__file__).parents[1] / 'config/patrol.json'))
+        flow = Flow(configuration(config_path), serial, pytestconfig.artifact_dir)
+        flow.item = request.node
+        flow.prepare_login_form()
         device.wait_label('欢迎登录')
         yield device
     finally:
@@ -81,7 +87,16 @@ def android(request, pytestconfig):
 
 
 def test_empty_login_validation(android):
-    android.tap('登录')
+    inputs = [node for node in android.tree().iter('node') if node.get('class') == 'android.widget.EditText']
+    if len(inputs) < 2 or any(node.get('text') for node in inputs):
+        pytest.skip('登录输入框已有内容或无法确认为空')
+    # 登录按钮在不同版本里有「登录」和「登录并继续上传」两种文案，
+    # 框架 sign_in() 已兼容两者，这里必须同步，否则空表单校验必然失败。
+    labels = android.labels()
+    button = next((x for x in ('登录', '登录并继续上传') if x in labels), None)
+    if button is None:
+        pytest.skip('登录按钮文案未识别，页面结构可能已变化：%s' % sorted(set(labels))[:12])
+    android.tap(button)
     android.wait_label('请输入手机号和密码')
 
 

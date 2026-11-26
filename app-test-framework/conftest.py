@@ -13,6 +13,7 @@ log = logging.getLogger(__name__)
 
 
 def pytest_addoption(parser):
+    parser.addoption('--release-230', action='store_true', help='Require installed LivFlow 2.3.0 / 111 before device tests')
     parser.addoption("--artifact-dir", default=None, help="Directory for this run's evidence")
     parser.addoption("--device", action="store_true", help="Enable real Android tests")
     parser.addoption("--app-config", default=str(ROOT / "config/android.yaml"))
@@ -39,6 +40,17 @@ def pytest_collection_modifyitems(config, items):
 @pytest.fixture
 def app_config(pytestconfig):
     return load_config(pytestconfig.getoption("--app-config"))
+
+
+@pytest.fixture(scope='session', autouse=True)
+def release_gate(pytestconfig):
+    if pytestconfig.getoption('--release-230') and pytestconfig.getoption('--device'):
+        import os
+        import json
+        from framework.release_gate import verify_release
+        evidence = verify_release(os.environ.get('ANDROID_UDID', ''))
+        (pytestconfig.artifact_dir / 'release.json').write_text(
+            json.dumps(evidence, indent=2), encoding='utf-8')
 
 
 @pytest.fixture

@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, Q
     QDialog, QFormLayout, QDialogButtonBox, QSpinBox, QScrollArea, QFrame, QLayout)
 
 from app_patrol_engine import BASE, RUNS, PREFIX, manual_session, write_session
+from patrol_account_picker import PatrolAccountPicker
 
 
 def default_framework():
@@ -89,6 +90,7 @@ class AppPatrolPanel(QWidget):
         self.mode.addItem('LivFlow 基础巡检 · 5 项，会重启 APP', 'smoke')
         self.mode.addItem('LivFlow 预览检查 · 3 项，只读当前页面', 'preview')
         self.mode.addItem('游客模式与空登录校验 · 4 项', 'flow_guest')
+        self.mode.addItem('测试账号登录 · 1 项', 'flow_login')
         self.mode.addItem('USB 相机无设备扫描 · 1 项', 'flow_usb')
         self.mode.addItem('全量自动巡检 · 3 框架 + 4 游客 + 1 USB + 9 设备流程', 'flow_full')
         for label,value in [('任务搜索、筛选、详情与统计','flow_tasks'),('任务筛选专项','flow_filters'),('语言、版本与日志导出','flow_settings'),
@@ -143,6 +145,10 @@ class AppPatrolPanel(QWidget):
         for w in (self.start, self.stop, self.configure, self.resume, self.new_manual, self.open_report):
             buttons.addWidget(w)
         root.addLayout(buttons)
+        login_row = QFormLayout()
+        self.login_accounts = PatrolAccountPicker('app', self)
+        login_row.addRow("本机测试账号", self.login_accounts)
+        root.addLayout(login_row)
         self.new_emg = QPushButton('新建肌电手环专项清单（人工记录）')
         self.new_emg.clicked.connect(self.create_emg_manual)
         root.addWidget(self.new_emg)
@@ -219,12 +225,13 @@ class AppPatrolPanel(QWidget):
         for widget,specific in ((self.allow_parameters,'flow_parameters'),(self.allow_record,'flow_record'),(self.allow_upload,'flow_upload')):
             widget.setVisible(mode in (specific,'flow_all','flow_full'))
         self.hint.setText({'selfcheck': '检查配置校验逻辑，不连接或操作手机。',
-            'smoke': '前提：LivFlow 已安装、已退出账号、界面语言为中文。会重启 APP，检查空表单、游客导航和语言切换。',
+            'smoke': '使用中文界面和测试账号。会重启 APP，如已登录会先退出，再检查空表单、游客导航和语言切换。',
             'preview': '前提：手机与设备已接入无密码“灵生测试”Wi-Fi，LivFlow 正在中文双目预览页。不会自动连接、配网或开始采集。',
-            'flow_guest': '前提：当前处于游客状态。检查空登录、任务页、蓝牙/USB入口与我的页面；不会自动退出已有账号或接受协议。',
+            'flow_guest': '如已登录，会先退出账号，再检查空登录、任务页、蓝牙/USB入口与我的页面。',
+            'flow_login': '选择本机测试账号后开始。已有登录态会先退出，再使用所选账号登录并检查任务页。',
             'flow_usb': '检查未连接 USB 相机时的扫描提示。相机权限需要你在手机上处理；不会连接相机或开始采集。',
             'files':'在流程配置选择本地 MCAP；可选择写入前文件作逐消息及元数据对比，不操作手机。'
-            ,'flow_full':'全量范围：3项框架 + 4项游客 + 1项USB空设备 + 9项设备流程。游客检查不会自动退出账号；未勾选的实际操作记未测。独立预览3项、65项人工清单另行执行。'
+            ,'flow_full':'全量范围：3项框架 + 4项游客 + 1项USB空设备 + 9项设备流程。已有登录态会先退出，后续设备流程需要时会提示重新登录。未勾选的实际操作记未测。'
             }.get(mode,'先点“流程配置”指定任务编号、EGO序列号等。需要登录、换网络或插卡时会等待，完成后点“已完成，继续”。不执行固件升级和删除。'))
 
     def configure_flow(self):
@@ -283,9 +290,6 @@ class AppPatrolPanel(QWidget):
             entry.setValue(int(config.get(key,value)))
             controls[key]=entry
             form.addRow(label,entry)
-        note = QLabel('账号密码只在手机输入。本页不保存密码。上传只处理你明确选择的一条测试记录，改写前自动备份。')
-        note.setWordWrap(True)
-        form.addRow(note)
         buttons = QDialogButtonBox(QDialogButtonBox.Save|QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
@@ -293,7 +297,7 @@ class AppPatrolPanel(QWidget):
         if dialog.exec() == QDialog.Accepted:
             for key,entry in controls.items():
                 config[key]=entry.isChecked() if isinstance(entry,QCheckBox) else entry.value() if isinstance(entry,QSpinBox) else entry.currentData() if isinstance(entry,QComboBox) else entry.text().strip()
-            config.setdefault('human_timeout',900)
+            config.setdefault('human_timeout',240)
             config.setdefault('wait_timeout',90)
             self.flow_config_path.parent.mkdir(parents=True,exist_ok=True)
             self.flow_config_path.write_text(json.dumps(config,ensure_ascii=False,indent=2),encoding='utf-8')
@@ -347,6 +351,7 @@ class AppPatrolPanel(QWidget):
         if not busy:self.log.appendPlainText('APP 版本操作结束，结果见版本更新区域；巡检记录未改写。')
 
     def _controls(self, busy):
+        self.login_accounts.setEnabled(not busy)
         self._busy = busy
         for w in (self.start, self.full, self.new_manual, self.new_emg, self.load, self.framework, self.mode, self.devices, self.refresh, self.rescan, self.browse, self.history,self.configure,self.allow_parameters,self.allow_record,self.allow_upload):
             w.setEnabled(not busy)
@@ -404,6 +409,14 @@ class AppPatrolPanel(QWidget):
         if mode not in ('selfcheck','files') and not serial:
             QMessageBox.warning(self, '没有选择手机', '请刷新并选择手机，或输入明确的序列号。')
             return
+        if mode == 'flow_login':
+            try:
+                selected_login = self.login_accounts.selected_account()
+            except (OSError, ValueError):
+                selected_login = {}
+            if not selected_login:
+                QMessageBox.warning(self, '没有选择测试账号', '请从本机测试账号列表选择一个账号。')
+                return
         RUNS.mkdir(parents=True, exist_ok=True)
         self.cancel_file = RUNS / ('cancel_' + uuid4().hex)
         self.session = None
@@ -420,6 +433,14 @@ class AppPatrolPanel(QWidget):
         env.insert('PYTHONIOENCODING', 'utf-8')
         env.insert('PYTHONUTF8', '1')
         env.remove('PYTHONPATH')
+        if mode == 'smoke' or mode.startswith('flow_'):
+            try:
+                account = self.login_accounts.selected_account()
+                if account:
+                    for key in ('PHONE', 'PASSWORD', 'ROLE'):
+                        env.insert('LIVFLOW_TEST_' + key, account[key])
+            except (OSError, ValueError):
+                self.log.appendPlainText('读取本机测试账号失败。本轮需要时将提示在手机登录。')
         self.proc.setProcessEnvironment(env)
         self.proc.setWorkingDirectory(str(BASE))
         args = [str(BASE / 'app_patrol_engine.py'),'--framework',str(root),'--mode',mode,'--serial',serial,
@@ -553,6 +574,14 @@ class AppPatrolPanel(QWidget):
         self.resume.setEnabled(bool(waiting) and self.busy)
         if waiting:
             self.summary.setText('等待人工操作：'+waiting['message'])
+        activity = self.session.get('activity', {})
+        if self.busy and activity:
+            details = '\n'.join(f'{label}  {activity[key]}' for key, label in (
+                ('case', '当前用例'), ('condition', '等待条件'),
+                ('page', '最近识别页面'), ('feedback', '操作回读'),
+            ) if activity.get(key))
+            if details:
+                self.summary.setText(self.summary.text() + '\n' + details)
         self.open_report.setEnabled(bool(self.session.get('report')))
         self._enable_edit(not self.busy and not self.read_only and self.session['mode'] == 'manual')
 
